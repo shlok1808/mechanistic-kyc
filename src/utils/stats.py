@@ -41,6 +41,45 @@ def macro_ovr_auroc(y_true, y_score, labels):
                                average="macro", labels=labels))
 
 
+def partial_spearman(x, y, control):
+    """Spearman partial correlation of x and y controlling for `control`.
+
+    Rank-transform all three, residualize x and y on the control ranks (with intercept),
+    then Pearson on the residuals. Used for the "whose side is the advice on" analysis:
+    corr(advice, stated_goal | risk_score) vs corr(advice, risk_score | stated_goal).
+    """
+    from scipy.stats import rankdata
+    rx, ry, rc = (rankdata(np.asarray(v, float)) for v in (x, y, control))
+    A = np.c_[rc, np.ones(len(rc))]
+    res_x = rx - A @ np.linalg.lstsq(A, rx, rcond=None)[0]
+    res_y = ry - A @ np.linalg.lstsq(A, ry, rcond=None)[0]
+    denom = np.std(res_x) * np.std(res_y)
+    if denom == 0:
+        return float("nan")
+    return float(np.mean((res_x - res_x.mean()) * (res_y - res_y.mean())) / denom)
+
+
+def standardized_rel_weights(X, y):
+    """Standardized OLS betas of y on X columns, plus each column's share of total |beta|.
+
+    The behavioral/probe "field importance" measure: fit y (advice or probe readout) on the
+    rubric-normalized field values, z-scoring everything first so betas are comparable, then
+    normalize |beta| to sum to 1 for comparison against the rubric's own weights.
+    Returns (betas, rel_weights, r2).
+    """
+    X = np.asarray(X, float)
+    y = np.asarray(y, float)
+    Xs = (X - X.mean(0)) / X.std(0)
+    ys = (y - y.mean()) / y.std()
+    A = np.c_[Xs, np.ones(len(ys))]
+    b = np.linalg.lstsq(A, ys, rcond=None)[0]
+    betas = b[:-1]
+    resid = A @ b - ys
+    r2 = 1.0 - float(resid @ resid) / float(((ys - ys.mean()) ** 2).sum())
+    rel = np.abs(betas) / np.abs(betas).sum()
+    return betas, rel, r2
+
+
 def auroc_ci(y_true, y_score, labels, n_boot=2000, seed=42):
     """Macro-OvR AUROC with a bootstrap 95% CI over the evaluation rows.
 

@@ -3,8 +3,9 @@ from collections import Counter
 
 import pytest
 
-from rubric import TIERS, load_rubric, risk_score, risk_tier, sample_profile
-from s1_generate_profiles import generate_balanced_profiles
+from rubric import (BINS, TIERS, factor_bin, factor_cell, factor_score, factor_scores,
+                    is_conflicted, load_rubric, risk_score, risk_tier, sample_profile)
+from profiles import generate_cell_balanced_profiles
 
 ALL_CONSERVATIVE = {
     "past_drawdown_reaction": "sold_everything",
@@ -68,12 +69,45 @@ def test_boring_middle_profile_is_moderate(rubric):
     assert risk_tier(score, rubric) == "moderate"
 
 
-def test_balanced_generation_hits_target_counts(rubric):
-    profiles, drawn = generate_balanced_profiles(rubric, n_per_tier=50, seed=42)
-    counts = Counter(p["tier"] for p in profiles)
-    for tier in TIERS:
-        assert counts[tier] == 50
+def test_cell_balanced_generation_fills_every_factor_cell(rubric):
+    """Sampling balances the willingness x capacity grid, not the blended tier."""
+    profiles, drawn = generate_cell_balanced_profiles(rubric, n_total=90, seed=42)
+    counts = Counter(p["factor_cell"] for p in profiles)
+    assert len(counts) == len(BINS) ** 2          # every cell present
+    assert set(counts.values()) == {90 // len(counts)}   # and equally full
     assert drawn >= len(profiles)
+
+
+def test_cell_balancing_oversamples_conflict_cases(rubric):
+    """The point of the grid: conflict cases stop being a 3.5% rounding error."""
+    profiles, _ = generate_cell_balanced_profiles(rubric, n_total=900, seed=7)
+    share = sum(p["conflicted"] for p in profiles) / len(profiles)
+    assert share > 0.15          # pilot (tier-balanced) sat near 0.07
+
+
+def test_factor_scores_span_unit_interval(rubric):
+    """Each factor is renormalised within itself, so extremes hit 0 and 1."""
+    assert factor_score(ALL_CONSERVATIVE, rubric, "willingness") == pytest.approx(0.0)
+    assert factor_score(ALL_AGGRESSIVE, rubric, "willingness") == pytest.approx(1.0)
+    assert factor_score(ALL_CONSERVATIVE, rubric, "capacity") == pytest.approx(0.0)
+    assert factor_score(ALL_AGGRESSIVE, rubric, "capacity") == pytest.approx(1.0)
+
+
+def test_every_rubric_field_belongs_to_exactly_one_factor(rubric):
+    """No field may be double-counted or orphaned, or factor scores stop being clean."""
+    assigned = [f for names in rubric["factors"].values() for f in names]
+    assert sorted(assigned) == sorted(rubric["fields"])
+    assert len(assigned) == len(set(assigned))
+
+
+def test_conflict_requires_opposing_bins(rubric):
+    """Conflict is willingness vs capacity, not merely a low or high overall score."""
+    assert not is_conflicted(ALL_CONSERVATIVE, rubric)   # both low -> concordant
+    assert not is_conflicted(ALL_AGGRESSIVE, rubric)     # both high -> concordant
+    mixed = dict(ALL_CONSERVATIVE, past_drawdown_reaction="bought_more",
+                 investing_experience="extensive")
+    assert factor_cell(mixed, rubric) == ("high", "low")
+    assert is_conflicted(mixed, rubric)
 
 
 def test_naive_distribution_matches_sanity_check(rubric):

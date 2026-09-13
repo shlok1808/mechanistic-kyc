@@ -14,6 +14,7 @@ diversity on top of these.
 """
 
 import hashlib
+import random
 import re
 
 # --- Banned lexicon (implicit tier only). The canonical list lives in config.yaml; this
@@ -311,20 +312,34 @@ def verbalize_field(field, value, mode, rng):
     raise KeyError(field)
 
 
-def render(profile, template_id, mode, rng):
-    """Assemble the full client narrative for `profile` under `template_id`/`mode`."""
+def render(profile, template_id, mode, rng, stable_seed=None):
+    """Assemble the full client narrative for `profile` under `template_id`/`mode`.
+
+    `stable_seed` makes each field's phrasing depend ONLY on that field. Normally the
+    fields share one rng stream, so a field whose wording consumes a different number
+    of draws shifts every sentence after it: flipping one field then rewords unrelated
+    sentences too. That is invisible for twins, but it silently breaks one-factor
+    counterfactual pairs, where the whole point is that exactly one sentence moves.
+    Pass a per-pair seed there and each field draws from its own independent stream.
+    """
     _, oi, ki = template_id.split("_")
     opening = OPENINGS[int(oi)].format(
         name=profile["name"], age=profile["age"],
         occupation=profile["occupation"], city=profile["city"],
     )
+
+    def field_rng(field):
+        return random.Random(f"{stable_seed}|{field}") if stable_seed is not None else rng
+
     block = {}
     for field in ("stated_goal", "horizon_years", "investing_experience",
                   "income_stability", "past_drawdown_reaction", "emergency_fund_months",
                   "dependents"):
-        block[field] = verbalize_field(field, profile[field], mode, rng)
-    block["net_worth"] = verbalize_field("net_worth", profile["net_worth_band"], mode, rng)
-    block["hobbies"] = verbalize_field("hobbies", profile["hobbies"], mode, rng)
+        block[field] = verbalize_field(field, profile[field], mode, field_rng(field))
+    block["net_worth"] = verbalize_field("net_worth", profile["net_worth_band"], mode,
+                                         field_rng("net_worth"))
+    block["hobbies"] = verbalize_field("hobbies", profile["hobbies"], mode,
+                                       field_rng("hobbies"))
 
     middle = " ".join(block[k] for k in ORDERINGS[int(ki)])
     return opening + " " + middle

@@ -26,11 +26,11 @@ Shards (results/activations/<model_tag>/shard_XXXX.npz) hold:
   vignette_type, contradictory). A meta.json records model/layers/positions/d and row order.
 Resume: vignette_ids already present in shards are skipped.
 
-torch/transformers are imported lazily (via s3_advice) so the pure logic here is testable
+torch/transformers are imported lazily (via advice) so the pure logic here is testable
 without a GPU.
 
 Usage:
-    python src/s4_cache_activations.py [--config config.yaml] [--dry-run] [--model ID]
+    python src/activations.py [--config config.yaml] [--dry-run] [--model ID]
         [--layers 20,25,31] [--device cuda] [--shard-size 512] [--overwrite]
 """
 
@@ -41,7 +41,8 @@ from pathlib import Path
 
 import yaml
 
-from s3_advice import (
+from utils.paths import cache_fingerprint, git_commit, model_tag, run_dir
+from advice import (
     build_user_message, cyclic_permutations, load_model, load_vignettes,
     make_prompt, slot_options, stratified_sample,
 )
@@ -110,12 +111,20 @@ def label_row(v):
         "pair_id": v.get("pair_id"), "tier": v["tier"],
         "risk_score": v["risk_score"], "vignette_type": v["vignette_type"],
         "contradictory": bool(v["contradictory"]),
+        # factor targets (the probe labels) ...
+        "willingness": v.get("willingness", -1.0), "capacity": v.get("capacity", -1.0),
+        "goals": v.get("goals", -1.0), "factor_cell": v.get("factor_cell", ""),
+        "conflicted": bool(v.get("conflicted", False)),
+        # ... which field a counterfactual pair varies ...
+        "pair_field": v.get("pair_field") or "", "pair_factor": v.get("pair_factor") or "",
+        # ... and the confound controls.
+        "template_id": v.get("template_id", ""), "name": v.get("name") or "",
+        "n_chars": int(v.get("n_chars", len(v.get("text", "")))),
     }
 
 
-def model_tag(model_id):
-    """Filesystem-safe short tag for the shard subdir, e.g. google/gemma-2-9b-it -> gemma-2-9b-it."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", model_id.split("/")[-1])
+# model_tag / run_dir / cache_fingerprint live in utils.paths (re-exported here so
+# existing call sites keep working).
 
 
 def parse_layers(spec, n_layers):
@@ -147,7 +156,7 @@ def next_shard_index(shard_dir):
 
 
 # --------------------------------------------------------------------------------------
-# Model-dependent driver (lazy torch via s3_advice.load_model)
+# Model-dependent driver (lazy torch via advice.load_model)
 # --------------------------------------------------------------------------------------
 def write_shard(shard_dir, idx, acts, labels):
     """Write one .npz: acts[n,L,P,d] fp16 + parallel label columns."""
@@ -175,7 +184,14 @@ def run(cfg, args):
         vignettes = stratified_sample(vignettes, cfg["s3"]["dry_run_n"], cfg["seed"])
 
     model_id = args.model or cfg["model"]["primary"]
-    shard_dir = Path(cfg["paths"]["results_dir"]) / "activations" / model_tag(model_id)
+    # The cache id covers the prompt, the data files, the layer set and the dtype --
+    # anything that changes an activation. Change any of them and this resolves to a
+    # different directory, so a resume can never silently mix incompatible runs.
+    vignette_files = sorted(Path(cfg["paths"]["vignettes_dir"]).glob("*.jsonl"))
+    fingerprint, cache_id = cache_fingerprint(
+        model_id, cfg["s3"]["prompts"]["framing"], vignette_files,
+        args.layers or cfg["extraction"]["layers"], POSITIONS, cfg["model"]["dtype"])
+    shard_dir = run_dir(cfg, model_id) / "activations" / cache_id
     if args.overwrite and shard_dir.exists():
         for f in shard_dir.glob("shard_*.npz"):
             f.unlink()
@@ -262,6 +278,9 @@ def run(cfg, args):
         "dtype_stored": "float16", "option_order": "identity_perm0",
         "n_vignettes_cached": len(already) + n_done, "seed": cfg["seed"],
         "attn_implementation": cfg["s3"]["attn_implementation"],
+        # provenance: what this cache is, and what it was built from
+        "cache_id": cache_id, "fingerprint": fingerprint,
+        "git_commit": git_commit(),
     }
     (shard_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"S4 done: {n_done} new rows -> {shard_dir}  (total {meta['n_vignettes_cached']})")

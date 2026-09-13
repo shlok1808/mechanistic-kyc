@@ -1,4 +1,4 @@
-"""S3 gate: read results/s3_results.jsonl and decide the go/no-go.
+"""S3 gate: read results/advice.jsonl and decide the go/no-go.
 
 Gate (pre-registered, config.yaml `gate:`):
   PASS = implicit Spearman rho(risk_score, aggressiveness) >= spearman_rho_min
@@ -9,7 +9,7 @@ and the contradictory two-condition paired diff (baseline vs instruction) -- a f
 not a gate.
 
 Usage:
-    python src/s3_gate.py [--config config.yaml] [--results results/s3_results.jsonl]
+    python src/gate.py [--config config.yaml] [--results results/advice.jsonl]
 """
 
 import argparse
@@ -18,6 +18,8 @@ from pathlib import Path
 
 import numpy as np
 import yaml
+
+from utils.paths import run_dir
 from scipy.stats import wilcoxon
 
 from utils.stats import spearman_ci
@@ -35,11 +37,22 @@ def compute_gate(rows, cfg):
 
     report = {"n_baseline": len(base), "n_twins": len(twins)}
 
-    # rho per vignette_type (+ overall) on twins
+    # rho per vignette_type (+ overall) on twins, and split by conflict status.
+    #
+    # The gate is judged on CONCORDANT rows only (pre-registered 2026-09-13). Two
+    # reasons, both known before the data existed: factor-cell balancing squeezes the
+    # blended-tier spread, which lowers rho by range restriction alone; and conflict
+    # cases are deliberately oversampled, which mixes the thing being measured into
+    # the check that measurement works. Conflict rho is reported with no threshold --
+    # it is a result, not a gate.
     report["spearman"] = {}
-    for label, subset in (("overall", twins),
-                          ("explicit", [r for r in twins if r["vignette_type"] == "explicit"]),
-                          ("implicit", [r for r in twins if r["vignette_type"] == "implicit"])):
+    implicit = [r for r in twins if r["vignette_type"] == "implicit"]
+    for label, subset in (
+            ("overall", twins),
+            ("explicit", [r for r in twins if r["vignette_type"] == "explicit"]),
+            ("implicit", implicit),
+            ("implicit_concordant", [r for r in implicit if not r.get("conflicted")]),
+            ("implicit_conflict", [r for r in implicit if r.get("conflicted")])):
         xs = [r["risk_score"] for r in subset]
         ys = [r["aggressiveness"] for r in subset]
         if len(subset) >= 10 and np.std(xs) > 0 and np.std(ys) > 0:
@@ -72,8 +85,11 @@ def compute_gate(rows, cfg):
             "wilcoxon_p": w_p,
             "ci": [round(float(np.percentile(d, 2.5)), 4), round(float(np.percentile(d, 97.5)), 4)]}
 
-    # gate decision
-    imp = report["spearman"].get("implicit", {})
+    # gate decision -- on the concordant subset, falling back to all-implicit only if
+    # the conflict flag is absent (e.g. a pilot-era results file).
+    judged_on = f"implicit_{gate_cfg.get('evaluate_on', 'concordant')}"
+    imp = report["spearman"].get(judged_on) or report["spearman"].get("implicit", {})
+    report["gate_judged_on"] = judged_on if judged_on in report["spearman"] else "implicit"
     rho_ok = imp.get("rho", -1) >= gate_cfg["spearman_rho_min"]
     hedge_ok = (report["hedge_rate"] is not None) and report["hedge_rate"] < gate_cfg["hedge_rate_max"]
     report["gate"] = {
@@ -90,11 +106,12 @@ def main():
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    res_path = Path(args.results) if args.results else Path(cfg["paths"]["results_dir"]) / "s3_results.jsonl"
+    res_dir = run_dir(cfg, args.model or cfg["model"]["primary"])
+    res_path = Path(args.results) if args.results else res_dir / "advice.jsonl"
     rows = [json.loads(l) for l in open(res_path)]
     report = compute_gate(rows, cfg)
 
-    out = Path(cfg["paths"]["results_dir"]) / "s3_gate.json"
+    out = res_dir / "gate.json"
     out.write_text(json.dumps(report, indent=2))
 
     print("=== S3 GATE ===")

@@ -23,7 +23,7 @@ memmapped acts_all.npy so RAM stays flat. Pure logic (splits, depth, selectivity
 is torch-free and unit-tested in tests/test_s5.py.
 
 Usage:
-    python src/s5_train_probes.py [--config config.yaml]
+    python src/probes.py [--config config.yaml]
         [--activations results/activations/gemma-2-9b-it]
         [--positions profile_end,profile_mean,decision] [--layers 18,20,...]
         [--seeds 5] [--no-ensemble]
@@ -76,10 +76,18 @@ def make_splits(profile_ids, seed=42, fracs=(0.70, 0.10, 0.20)):
 def split_indices(labels, split):
     """Row-index arrays for each probe split, given per-row `labels` and a profile->split map.
 
-    train/val/explicit_test draw from EXPLICIT rows; implicit_test (headline) and the optional
-    implicit_train ceiling draw from IMPLICIT rows; pairs (pair_id set) are excluded.
+    train/val/explicit_test draw from EXPLICIT rows. implicit_val is the DEV set that
+    chooses layer/position; implicit_test is the headline eval, touched once. Pairs
+    (pair_id set) are excluded.
+
+    implicit_val exists because selecting on implicit_test is selection on the eval
+    set: the June sweep took argmax over 126 (layer, position) cells scored on the
+    test split and then reported that cell, worth roughly +0.006 AUROC of winner's
+    curse. The implicit rows of val profiles were being discarded, so the dev set
+    needed for an honest selection was already there and simply unused.
     """
-    buckets = {"train": [], "val": [], "explicit_test": [], "implicit_test": [], "implicit_train": []}
+    buckets = {"train": [], "val": [], "explicit_test": [],
+               "implicit_val": [], "implicit_test": [], "implicit_train": []}
     for i, lab in enumerate(labels):
         if PAIRS_EXCLUDED and lab.get("pair_id") is not None:
             continue
@@ -92,6 +100,8 @@ def split_indices(labels, split):
         elif vt == "implicit":
             if s == "test":
                 buckets["implicit_test"].append(i)
+            elif s == "val":
+                buckets["implicit_val"].append(i)      # DEV set: picks layer/position
             elif s == "train":
                 buckets["implicit_train"].append(i)
     return {k: np.asarray(v, dtype=int) for k, v in buckets.items()}
@@ -139,7 +149,9 @@ def consolidate(act_dir):
     if not shards:
         raise FileNotFoundError(f"no shards in {act_dir} -- run S4 first")
 
-    label_keys = ["vignette_id", "profile_id", "pair_id", "tier", "risk_score",
+    label_keys = ["vignette_id", "profile_id", "pair_id", "pair_field", "pair_factor",
+                  "willingness", "capacity", "goals", "factor_cell", "conflicted",
+                  "template_id", "name", "n_chars", "tier", "risk_score",
                   "vignette_type", "contradictory"]
 
     # Reuse only if the consolidation is internally consistent AND up to date with the shards
@@ -280,7 +292,7 @@ def probe_to_npz(path, probe, ridge_coef, layer, position, frac):
 # (28 small fits across the cores beats one fit spread thin over 28 cores).
 # --------------------------------------------------------------------------------------
 def _sweep_cell(acts_path, l_idx, p_idx, layer, position, frac, idx,
-                ytr, yva, str_tr, tier_et, tier_it, score_it, n_layers_model, cell_seed):
+                ytr, yva, str_tr, tier_et, tier_iv, tier_it, score_it, n_layers_model, cell_seed):
     try:
         from threadpoolctl import threadpool_limits
         ctx = threadpool_limits(1)
@@ -292,8 +304,10 @@ def _sweep_cell(acts_path, l_idx, p_idx, layer, position, frac, idx,
         plane = load_plane(acts, l_idx, p_idx)
         Xtr, Xva = plane[idx["train"]], plane[idx["val"]]
         Xet, Xit = plane[idx["explicit_test"]], plane[idx["implicit_test"]]
+        Xiv = plane[idx["implicit_val"]]
         probe = fit_logistic(Xtr, ytr, Xva, yva, seed=cell_seed)
         et_auc, et_acc, _ = eval_probe(probe, Xet, tier_et)
+        iv_auc, _, _ = eval_probe(probe, Xiv, tier_iv)      # DEV score -- selection uses this
         it_auc, it_acc, it_proba = eval_probe(probe, Xit, tier_it)
         _, _, va_proba = eval_probe(probe, Xva, yva)
         rng = np.random.default_rng(cell_seed)        # deterministic per-cell control shuffle
@@ -303,6 +317,7 @@ def _sweep_cell(acts_path, l_idx, p_idx, layer, position, frac, idx,
         r2 = ridge_r2(Xtr, str_tr, Xit, score_it, seed=cell_seed)
     rec = {"frac_depth": frac,
            "explicit_test": {"auroc": round(et_auc, 4), "acc": round(et_acc, 4)},
+           "implicit_val": {"auroc": round(iv_auc, 4)},
            "implicit_test": {"auroc": round(it_auc, 4), "acc": round(it_acc, 4),
                              "ridge_r2": round(r2, 4)},
            "control_auroc": round(ctrl_auc, 4), "selectivity": selectivity(it_auc, ctrl_auc)}
@@ -330,6 +345,78 @@ def _seed_fit(acts_path, l_idx, p_idx, tr_idx, va_idx, it_idx, ytr, yva, yit, se
 # --------------------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------------------
+def confound_baselines(labels, idx, tier, seed=42):
+    """How far do pure surface features get on the SAME split the probe is scored on?
+
+    Length, template family and client name carry no rubric information by
+    construction, so a probe that only matches these is reading surface form rather
+    than an integrated client model. Reported next to the probe, never subtracted
+    from it.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import OneHotEncoder
+    out = {}
+    specs = {
+        "length": ("n_chars", "numeric"),
+        "template_id": ("template_id", "categorical"),
+        "name": ("name", "categorical"),
+    }
+    for label, (key, kind) in specs.items():
+        raw = [lab.get(key) for lab in labels]
+        if any(v is None or v == "" for v in raw):
+            continue
+        if kind == "numeric":
+            X = np.array([[float(v)] for v in raw])
+        else:
+            X = OneHotEncoder(handle_unknown="ignore").fit_transform(
+                [[str(v)] for v in raw]).toarray()
+        clf = LogisticRegression(max_iter=2000, random_state=seed).fit(
+            X[idx["train"]], tier[idx["train"]])
+        auc = macro_ovr_auroc(tier[idx["implicit_test"]],
+                              clf.predict_proba(X[idx["implicit_test"]]),
+                              list(clf.classes_))
+        out[label] = round(float(auc), 4)
+    return out
+
+
+def factor_probe_sweep(acts_path, acts, labels, idx, cells, cfg_layers, positions,
+                       n_layers_model, factors, seed, n_jobs):
+    """One dev-selected probe per FACTOR, so the report can say WHICH concept is read.
+
+    A probe on the blended tier cannot distinguish "the model tracks the client's
+    willingness" from "the model tracks their capacity" -- the blended label mixes
+    both. Each factor is binned into low/mid/high and gets its own sweep and its own
+    dev-selected (layer, position); where a factor peaks is itself a result.
+    """
+    from rubric import BINS, factor_bin
+    out = {}
+    for factor in factors:
+        if factor not in labels[0]:
+            continue
+        y = np.array([factor_bin(float(lab[factor]), BINS) for lab in labels])
+        if len(set(y[idx["train"]])) < 2 or len(set(y[idx["implicit_val"]])) < 2:
+            continue
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(_sweep_cell)(acts_path, cfg_layers.index(l), p_idx, l, p,
+                                 fractional_depth(l, n_layers_model), idx,
+                                 y[idx["train"]], y[idx["val"]],
+                                 np.zeros(len(idx["train"])),
+                                 y[idx["explicit_test"]], y[idx["implicit_val"]],
+                                 y[idx["implicit_test"]], np.zeros(len(idx["implicit_test"])),
+                                 n_layers_model, seed + 1000 * p_idx + l)
+            for p_idx, p, l in cells)
+        pick = max(results, key=lambda r: r["rec"]["implicit_val"]["auroc"])
+        out[factor] = {
+            "layer": pick["layer"], "position": pick["position"],
+            "frac_depth": pick["rec"]["frac_depth"],
+            "implicit_val_auroc": pick["rec"]["implicit_val"]["auroc"],
+            "implicit_auroc": pick["rec"]["implicit_test"]["auroc"],
+            "control_auroc": pick["rec"]["control_auroc"],
+            "selectivity": pick["rec"]["selectivity"],
+        }
+    return out
+
+
 def run(cfg, args):
     act_dir = Path(args.activations or
                    Path(cfg["paths"]["results_dir"]) / "activations" / "gemma-2-9b-it")
@@ -347,9 +434,10 @@ def run(cfg, args):
     tier = np.array([lab["tier"] for lab in labels])
     score = np.array([lab["risk_score"] for lab in labels], dtype=float)
     print(f"S5: train={len(idx['train'])} val={len(idx['val'])} "
-          f"explicit_test={len(idx['explicit_test'])} implicit_test={len(idx['implicit_test'])}")
+          f"explicit_test={len(idx['explicit_test'])} "
+          f"implicit_val={len(idx['implicit_val'])} implicit_test={len(idx['implicit_test'])}")
     n_tiers = len(set(tier))
-    for key in ("train", "val", "implicit_test"):
+    for key in ("train", "val", "implicit_val", "implicit_test"):
         present = set(tier[idx[key]]) if len(idx[key]) else set()
         if len(idx[key]) < 3 * n_tiers or len(present) < n_tiers:
             raise RuntimeError(
@@ -385,29 +473,33 @@ def run(cfg, args):
     acts_path = str(Path(act_dir) / "acts_all.npy")
     n_jobs = args.n_jobs if args.n_jobs else max(1, (os.cpu_count() or 4) - 2)
     tier_et, tier_it = tier[idx["explicit_test"]], tier[idx["implicit_test"]]
+    tier_iv = tier[idx["implicit_val"]]
     score_it = score[idx["implicit_test"]]
     cells = [(positions_all.index(p), p, l) for p in positions for l in layers]
     print(f"    {len(cells)} cells across n_jobs={n_jobs} ...", flush=True)
     results = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(_sweep_cell)(acts_path, cfg_layers.index(l), p_idx, l, p,
                              fractional_depth(l, n_layers_model), idx, ytr, yva, str_tr,
-                             tier_et, tier_it, score_it, n_layers_model,
+                             tier_et, tier_iv, tier_it, score_it, n_layers_model,
                              cfg["seed"] + 1000 * p_idx + l)
         for p_idx, p, l in cells)
 
     sweep = {p: {} for p in positions}
     proba_store = {}            # (layer, position) -> {'val','imp'} for the ensemble
     probes = {}                 # (layer, position) -> fitted probe (reused for persistence)
-    best = {"implicit_auroc": -1.0}
+    best = {"implicit_val_auroc": -1.0}
     for r in results:
         sweep[r["position"]][r["layer"]] = r["rec"]
         proba_store[(r["layer"], r["position"])] = {"val": r["va_proba"], "imp": r["it_proba"]}
         probes[(r["layer"], r["position"])] = r["probe"]
-        it_auc = r["rec"]["implicit_test"]["auroc"]
-        if it_auc > best["implicit_auroc"]:
+        # SELECT ON DEV. The test score is recorded but must not steer the choice.
+        iv_auc = r["rec"]["implicit_val"]["auroc"]
+        if iv_auc > best["implicit_val_auroc"]:
             best = {"position": r["position"], "layer": r["layer"], "l_idx": r["l_idx"],
                     "p_idx": r["p_idx"], "frac_depth": r["rec"]["frac_depth"],
-                    "implicit_auroc": it_auc, "ridge_r2": r["rec"]["implicit_test"]["ridge_r2"],
+                    "implicit_val_auroc": iv_auc,
+                    "implicit_auroc": r["rec"]["implicit_test"]["auroc"],
+                    "ridge_r2": r["rec"]["implicit_test"]["ridge_r2"],
                     "probe": r["probe"], "ridge_coef": None}
 
     # ---- headline CI + 5-seed stability at l* ----
@@ -447,6 +539,12 @@ def run(cfg, args):
                     "implicit_auroc": round(ens_auc, 4),
                     "lift_over_best_single": round(ens_auc - best["implicit_auroc"], 4)}
 
+    # ---- per-factor probes + confound controls ----
+    factor_probes = factor_probe_sweep(
+        acts_path, acts, labels, idx, cells, cfg_layers, positions, n_layers_model,
+        [f for f in cfg["probe"].get("targets", []) if f != "tier"], cfg["seed"], n_jobs)
+    controls = confound_baselines(labels, idx, tier, seed=cfg["seed"])
+
     # ---- thresholds (pre-registered) ----
     pcfg = cfg["probe"]
     tfidf_imp = baselines.get("tfidf", {}).get("implicit_test", 0.5)
@@ -459,19 +557,20 @@ def run(cfg, args):
     }
     thresholds["RQ1_clean_win"] = bool(thresholds["auroc_pass"] and thresholds["baseline_margin_pass"])
 
-    # ---- persist (model-tagged so 2B-dev and 9B-prod runs never collide) ----
-    from s4_cache_activations import model_tag
-    tag = model_tag(meta["model"])
-    res_dir = Path(cfg["paths"]["results_dir"])
-    probe_dir = res_dir / "probes" / tag
+    # ---- persist: results/<model>/ ; the model is the DIRECTORY, never the filename ----
+    from utils.paths import run_dir
+    out_dir = run_dir(cfg, meta["model"])
+    probe_dir = out_dir / "weights"
     probe_dir.mkdir(parents=True, exist_ok=True)
     # best overall + the best layer at each position (S10/S11 read at 'decision'), reusing the
     # probes already fit in the sweep -- no refitting.
     probe_to_npz(probe_dir / f"probe_best_L{bl}_{bp}.npz", best["probe"], None, bl, bp, best["frac_depth"])
     per_position_best = {}
     for p in positions:
-        bl_p = max(sweep[p], key=lambda l: sweep[p][l]["implicit_test"]["auroc"])
-        per_position_best[p] = {"layer": bl_p, "implicit_auroc": sweep[p][bl_p]["implicit_test"]["auroc"]}
+        bl_p = max(sweep[p], key=lambda l: sweep[p][l]["implicit_val"]["auroc"])   # dev-selected
+        per_position_best[p] = {"layer": bl_p,
+                                "implicit_val_auroc": sweep[p][bl_p]["implicit_val"]["auroc"],
+                                "implicit_auroc": sweep[p][bl_p]["implicit_test"]["auroc"]}
         probe_to_npz(probe_dir / f"probe_L{bl_p}_{p}.npz", probes[(bl_p, p)], None,
                      bl_p, p, fractional_depth(bl_p, n_layers_model))
 
@@ -484,9 +583,10 @@ def run(cfg, args):
         "best": {k: v for k, v in best.items() if k not in ("probe", "l_idx", "p_idx", "ridge_coef")},
         "per_position_best": per_position_best,
         "seed_stability": stability, "baselines": baselines, "ensemble": ensemble,
+        "factor_probes": factor_probes, "confound_controls": controls,
         "thresholds": thresholds, "sweep": sweep,
     }
-    out = res_dir / f"s5_probe_results_{tag}.json"
+    out = out_dir / "probes.json"
     out.write_text(json.dumps(report, indent=2))
     _print_summary(report)
     print(f"  report -> {out}  |  probes -> {probe_dir}")

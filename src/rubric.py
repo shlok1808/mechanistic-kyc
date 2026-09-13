@@ -1,6 +1,21 @@
-"""Ground-truth risk-tolerance rubric: scoring, tiering, and profile sampling.
+"""Ground-truth client rubric: factor scoring, tiering, and profile sampling.
 
-See config.yaml's `rubric:` block for field weights and mappings.
+Every rubric field belongs to exactly one FACTOR (see config.yaml `rubric.factors`):
+
+  willingness  how comfortable the client is with volatility and loss
+  capacity     whether they can objectively absorb a loss
+  goals        what the money is for
+
+Each factor scores independently in [0,1]. The blended `risk_score` / `tier` still
+exist as derived convenience labels, but they are no longer the probe target: a
+single blended number cannot say WHICH concept the model learned, and suitability
+law (FINRA 2111) turns on willingness and capacity being separate things.
+
+A profile is CONFLICTED when willingness and capacity land in opposite bins. Those
+are the cases the study is about, so profiles are sampled to fill the willingness x
+capacity grid evenly rather than to balance the blended tier.
+
+See config.yaml's `rubric:` block for field weights, factor membership, and bins.
 """
 
 import yaml
@@ -96,6 +111,56 @@ def risk_tier(score, rubric):
     return "aggressive"
 
 
+BINS = ("low", "mid", "high")
+
+
+def factor_fields(rubric, factor):
+    """Field names belonging to `factor`, in config order."""
+    return list(rubric["factors"][factor])
+
+
+def factor_score(profile, rubric, factor):
+    """Factor score in [0,1]: the factor's fields, reweighted within the factor.
+
+    Weights are renormalised so each factor spans the full [0,1] range regardless of
+    how much of the blended score its fields happen to carry.
+    """
+    fields = factor_fields(rubric, factor)
+    total = sum(rubric["fields"][f]["weight"] for f in fields)
+    return sum(
+        rubric["fields"][f]["weight"] * field_subscore(rubric["fields"][f], profile[f])
+        for f in fields
+    ) / total
+
+
+def factor_scores(profile, rubric):
+    """{factor: score in [0,1]} for every factor in the ontology."""
+    return {f: factor_score(profile, rubric, f) for f in rubric["factors"]}
+
+
+def factor_bin(value, bins=BINS):
+    """Cut a [0,1] factor score into evenly-spaced ordinal bins."""
+    idx = min(int(value * len(bins)), len(bins) - 1)
+    return bins[idx]
+
+
+def factor_cell(profile, rubric):
+    """(willingness_bin, capacity_bin) -- the cell profiles are balanced over."""
+    return (factor_bin(factor_score(profile, rubric, "willingness")),
+            factor_bin(factor_score(profile, rubric, "capacity")))
+
+
+def is_conflicted(profile, rubric):
+    """True when willingness and capacity point opposite ways (the FINRA 2111 case).
+
+    Distinct from `is_contradictory`, which compares what the client SAYS they want
+    (stated_goal) against how they BEHAVED (past_drawdown_reaction). This one is the
+    want-vs-afford conflict; that one is the say-vs-do conflict.
+    """
+    cell = [list(c) for c in rubric["conflict_bins"]]
+    return list(factor_cell(profile, rubric)) in cell
+
+
 # Stated-vs-revealed risk conflict: what the client SAYS they want (stated_goal) vs how
 # they actually BEHAVED in a drawdown (past_drawdown_reaction). A strong mismatch is the
 # "contradictory" case we tag for the S3 integration experiment.
@@ -141,5 +206,10 @@ def sample_profile(rubric, rng, profile_id):
     profile.update(sample_decoy_fields(rng))
     score = risk_score(profile, rubric)
     profile["risk_score"] = round(score, 2)
-    profile["tier"] = risk_tier(score, rubric)
+    profile["tier"] = risk_tier(score, rubric)          # derived, no longer the target
+    for name, value in factor_scores(profile, rubric).items():
+        profile[name] = round(value, 4)
+        profile[f"{name}_bin"] = factor_bin(value)
+    profile["factor_cell"] = "/".join(factor_cell(profile, rubric))
+    profile["conflicted"] = is_conflicted(profile, rubric)
     return profile

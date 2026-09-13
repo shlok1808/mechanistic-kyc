@@ -3,18 +3,19 @@
 import json
 import random
 import re
+from collections import Counter
 
 import pytest
 import yaml
 
-from rubric import is_contradictory, load_rubric, risk_tier, risk_score
-from s1b_edge_profiles import assign_decoys, build_edge_rubric_fields
-from s2b_qc import tenure_incoherences
+from rubric import field_subscore, is_contradictory, load_rubric, risk_tier, risk_score
+from edge_profiles import assign_decoys, build_edge_rubric_fields
+from qc import tenure_incoherences
 from templates import (
     BAND_PHRASINGS, ENUM_PHRASINGS, NET_WORTH_PHRASINGS, TEMPLATE_IDS,
     build_banned_regex, find_banned, pick_template_id, render,
 )
-from s2_render_vignettes import build_pair_jobs, build_twin_jobs, finalize
+from vignettes import build_pair_jobs, build_twin_jobs, finalize
 
 
 @pytest.fixture(scope="module")
@@ -108,26 +109,67 @@ def test_twins_share_template_differ_in_type(cfg):
 
 
 # -- pair construction -----------------------------------------------------------------
-def test_pairs_share_filler_and_template_differ_in_tier(cfg):
+def _field_of(job, field, rubric):
+    """One rubric field's value for a pair side (jobs carry the raw dict)."""
+    return job["rubric_fields"][field]
+
+
+def test_pairs_differ_in_exactly_one_rubric_field(cfg):
+    """The whole point of a counterfactual pair.
+
+    The June pilot drew both sides independently, so a "matched pair" differed on a
+    median of 7 of 8 rubric fields and never on fewer than 4. Patching across that
+    cannot attribute an effect to any one factor.
+    """
     rubric = cfg["rubric"]
-    jobs = build_pair_jobs(rubric, n_pairs=5, render_tier="implicit", seed=42)
-    assert len(jobs) == 10
+    jobs = build_pair_jobs(rubric, n_pairs=40, render_tier="implicit", seed=42)
     by_pair = {}
     for j in jobs:
         by_pair.setdefault(j["pair_id"], []).append(j)
-    for pid, (a, b) in ((k, v) for k, v in by_pair.items()):
-        assert a["template_id"] == b["template_id"]
-        assert {a["tier"], b["tier"]} == {"conservative", "aggressive"}
-        assert a["pair_id"] == b["pair_id"] == pid
+    assert len(by_pair) == 40
+    for pid, sides in by_pair.items():
+        assert len(sides) == 2
+        a, b = sorted(sides, key=lambda j: j["pair_side"])
+        assert a["template_id"] == b["template_id"]          # same template
+        assert a["name"] == b["name"]                        # same person
+        assert a["pair_field"] == b["pair_field"]            # same field under test
+        field = a["pair_field"]
+        differing = [f for f in rubric["fields"]
+                     if _field_of(a, f, rubric) != _field_of(b, f, rubric)]
+        assert differing == [field], f"{pid}: expected only {field}, got {differing}"
 
 
-def test_pair_tiers_match_their_drawn_rubric(cfg):
+def test_pair_field_coverage_is_even_across_factors(cfg):
+    """Every rubric field gets tested equally, so no factor is under-powered."""
     rubric = cfg["rubric"]
-    jobs = build_pair_jobs(rubric, n_pairs=20, render_tier="implicit", seed=7)
+    jobs = build_pair_jobs(rubric, n_pairs=len(rubric["fields"]) * 4,
+                           render_tier="implicit", seed=7)
+    counts = Counter(j["pair_field"] for j in jobs)
+    assert set(counts) == set(rubric["fields"])
+    assert len(set(counts.values())) == 1          # perfectly even
+
+
+def test_pair_sides_straddle_the_field_scale(cfg):
+    """lo and hi must sit at opposite ends, or the contrast has no strength."""
+    rubric = cfg["rubric"]
+    jobs = build_pair_jobs(rubric, n_pairs=24, render_tier="implicit", seed=3)
+    by_pair = {}
     for j in jobs:
-        # the cons side narrative should mention conservative-leaning life facts; we only
-        # assert the recorded tier is internally consistent and in-range.
-        assert j["tier"] in ("conservative", "aggressive")
+        by_pair.setdefault(j["pair_id"], []).append(j)
+    for sides in by_pair.values():
+        lo = next(j for j in sides if j["pair_side"] == "lo")
+        hi = next(j for j in sides if j["pair_side"] == "hi")
+        assert hi["risk_score"] > lo["risk_score"]
+        spec = rubric["fields"][lo["pair_field"]]
+        assert field_subscore(spec, _field_of(hi, hi["pair_field"], rubric)) == 1.0
+        assert field_subscore(spec, _field_of(lo, lo["pair_field"], rubric)) == 0.0
+
+
+def test_pair_factor_matches_the_ontology(cfg):
+    """pair_factor must name the factor that owns pair_field."""
+    rubric = cfg["rubric"]
+    for j in build_pair_jobs(rubric, n_pairs=16, render_tier="implicit", seed=11):
+        assert j["pair_field"] in rubric["factors"][j["pair_factor"]]
 
 
 # -- finalize / schema -----------------------------------------------------------------
@@ -135,10 +177,28 @@ def test_finalize_schema_and_banned_field(banned, cfg):
     _, rx = banned
     job = build_twin_jobs([SAMPLE_PROFILE], seed=42, rubric=cfg["rubric"])[1]  # implicit
     row = finalize(job, "I moved everything into cash.", "gpt-4o-mini", rx)
-    assert set(row) == {"vignette_id", "profile_id", "pair_id", "tier", "risk_score",
-                        "vignette_type", "template_id", "contradictory",
-                        "paraphrase_model", "banned_terms_found", "text"}
+    required = {"vignette_id", "profile_id", "pair_id", "tier", "risk_score",
+                "vignette_type", "template_id", "contradictory", "paraphrase_model",
+                "banned_terms_found", "text",
+                # factor targets: a blended tier cannot say which concept was learned
+                "willingness", "capacity", "goals", "factor_cell", "conflicted",
+                # confound controls, so surface form can be ruled out at probe time
+                "name", "n_chars"}
+    assert required <= set(row)
+    assert "template_text" not in row          # intermediate, must be dropped
+    assert "rubric_fields" not in row          # intermediate, must be dropped
     assert row["banned_terms_found"] == []
+    assert row["n_chars"] == len(row["text"])
+
+
+def test_factor_columns_agree_with_the_rubric(cfg):
+    """The columns written onto a row must equal a fresh computation from the profile."""
+    from rubric import factor_scores, is_conflicted
+    job = build_twin_jobs([SAMPLE_PROFILE], seed=42, rubric=cfg["rubric"])[0]
+    expected = factor_scores(SAMPLE_PROFILE, cfg["rubric"])
+    for name, value in expected.items():
+        assert job[name] == pytest.approx(round(value, 4))
+    assert job["conflicted"] == is_conflicted(SAMPLE_PROFILE, cfg["rubric"])
 
 
 def test_finalize_flags_leak(banned, cfg):
@@ -276,3 +336,25 @@ def test_collect_batch_caches_clean_and_falls_back_on_leak(tmp_path, banned):
     assert summary["cached"] == 2 and summary["fallbacks"] == 1
     assert c.paraphrase_one("narrative a", "implicit") == ("I moved everything into cash.", "gpt-4o-mini")
     assert c.paraphrase_one("narrative b", "implicit") == ("narrative b", "template-only")
+
+
+def test_pair_narratives_differ_in_exactly_one_sentence(cfg):
+    """The token-level guarantee activation patching actually depends on.
+
+    Field-level isolation is not enough. templates.render draws phrasing from one rng
+    stream, so a field whose wording consumes a different number of draws used to
+    shift every sentence after it -- flipping one field silently reworded unrelated
+    sentences. build_pair_jobs passes a stable per-field seed to stop that.
+    """
+    rubric = cfg["rubric"]
+    jobs = build_pair_jobs(rubric, n_pairs=48, render_tier="implicit", seed=42)
+    by_pair = {}
+    for j in jobs:
+        by_pair.setdefault(j["pair_id"], []).append(j)
+    for pid, sides in by_pair.items():
+        lo = next(j for j in sides if j["pair_side"] == "lo")["template_text"]
+        hi = next(j for j in sides if j["pair_side"] == "hi")["template_text"]
+        a, b = lo.split(". "), hi.split(". ")
+        assert len(a) == len(b), f"{pid}: sentence count changed"
+        differing = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+        assert len(differing) == 1, f"{pid}: {len(differing)} sentences differ, expected 1"

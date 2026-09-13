@@ -33,3 +33,10 @@ env/
 # Private project context (local-only, not for the repo)
 CLAUDE.md
 mechanistic_kyc_pipeline_design.md
+RESEARCH_LOG.md
+
+# archived pilot run (regenerable, large)
+archive/
+
+# progress reports: unpublished results, submit directly rather than publishing
+reports/

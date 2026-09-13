@@ -1,6 +1,6 @@
 """S3: feed each vignette to frozen Gemma-2-9B-it as a financial advisor, read its
 4-option portfolio choice as single-token logits, and write a continuous aggressiveness
-score per (vignette, condition) to results/s3_results.jsonl.
+score per (vignette, condition) to results/advice.jsonl.
 
 Pipeline per vignette:
   - build the advisor prompt (client narrative + 4 lettered allocation options),
@@ -18,7 +18,7 @@ The torch/transformers imports are lazy so the pure scoring logic is unit-testab
 machine without a GPU or PyTorch.
 
 Usage:
-    python src/s3_advice.py [--config config.yaml] [--dry-run] [--model ID] [--device cuda]
+    python src/advice.py [--config config.yaml] [--dry-run] [--model ID] [--device cuda]
 """
 
 import argparse
@@ -245,19 +245,27 @@ def run(cfg, args):
             "vignette_id": vid, "profile_id": v["profile_id"], "pair_id": v.get("pair_id"),
             "vignette_type": v["vignette_type"], "tier": v["tier"],
             "risk_score": v["risk_score"], "contradictory": v["contradictory"],
+            # factor columns: the gate splits on `conflicted`, and patterns/probes
+            # need the per-factor targets alongside the blended tier.
+            "willingness": v.get("willingness"), "capacity": v.get("capacity"),
+            "goals": v.get("goals"), "factor_cell": v.get("factor_cell"),
+            "conflicted": bool(v.get("conflicted", False)),
+            "pair_field": v.get("pair_field"), "pair_factor": v.get("pair_factor"),
             "condition": cond, "p_alloc": [round(p, 5) for p in p_alloc],
             "aggressiveness": round(aggressiveness(p_alloc, equity), 5),
             "p_letters": round(p_letters_mean, 5), "hedged": bool(hedged),
         })
 
-    res_dir = Path(cfg["paths"]["results_dir"])
-    res_dir.mkdir(parents=True, exist_ok=True)
+    # results/<model>/ -- the model is the directory, never the filename, so a 2B
+    # dev run can never overwrite a 9B production run.
+    from utils.paths import run_dir
+    res_dir = run_dir(cfg, model_id)
     suffix = "_dryrun" if args.dry_run else ""
-    out_path = res_dir / f"s3_results{suffix}.jsonl"
+    out_path = res_dir / f"advice{suffix}.jsonl"
     with open(out_path, "w") as f:
         for r in out_rows:
             f.write(json.dumps(r) + "\n")
-    (res_dir / f"s3_meta{suffix}.json").write_text(json.dumps({
+    (res_dir / f"advice_meta{suffix}.json").write_text(json.dumps({
         "model": model_id, "n_permutations": len(permutations),
         "attn_implementation": s3["attn_implementation"], "letter_token_ids": letter_ids,
         "equity_fractions": equity, "seed": cfg["seed"],

@@ -5,7 +5,7 @@ Focus: the position-indexing logic, which the design doc flags as S4's main fail
 
 import pytest
 
-from s4_cache_activations import (
+from activations import (
     label_row, model_tag, narrative_end_char, narrative_start_char, parse_layers,
     token_covering_char,
 )
@@ -113,5 +113,16 @@ def test_label_row_schema():
          "contradictory": 0, "text": "...", "template_id": "t"}
     row = label_row(v)
     assert row["contradictory"] is False
-    assert set(row) == {"vignette_id", "profile_id", "pair_id", "tier",
-                        "risk_score", "vignette_type", "contradictory"}
+    # split keys + blended label ...
+    assert {"vignette_id", "profile_id", "pair_id", "tier", "risk_score",
+            "vignette_type", "contradictory"} <= set(row)
+    # ... the factor targets a blended tier cannot separate ...
+    assert {"willingness", "capacity", "goals", "factor_cell", "conflicted"} <= set(row)
+    # ... which field a counterfactual pair varies, for attributable patching ...
+    assert {"pair_field", "pair_factor"} <= set(row)
+    # ... and the surface-form controls.
+    assert {"template_id", "name", "n_chars"} <= set(row)
+    # pair_id is legitimately None on twins, but the string columns must never be:
+    # np.savez stores them as object arrays and None round-trips badly.
+    assert all(row[k] is not None
+               for k in ("pair_field", "pair_factor", "template_id", "name", "factor_cell"))

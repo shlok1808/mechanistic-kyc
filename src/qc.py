@@ -2,13 +2,13 @@
 
 Checks (design-doc §6.7):
   - banned-lexicon scan over implicit + implicit-tier pairs == 0 hits        [HARD]
-  - tier balance within +/- tier_balance_tol
+  - factor-cell (willingness x capacity) balance within +/- tier_balance_tol
   - mean token length matched across tiers & types within +/- token_len_tol
   - MinHash near-duplicate fraction < dup_fraction_max
   - age/experience coherence: young clients don't assert a long investing tenure (soft)
   - round-trip tier-recovery on a sample of implicit vignettes (signal survived?)
 
-Writes results/s2_qc_report.json and prints a summary.
+Writes results/qc_report.json and prints a summary.
 """
 
 import argparse
@@ -140,15 +140,32 @@ def roundtrip_recovery(implicit_rows, k, cfg):
     except Exception:
         return None
 
-    correct = 0
+    # Raw accuracy is the wrong headline on a skewed label. Profiles are balanced over
+    # the willingness x capacity grid, so the DERIVED tier comes out near 28/59/13 and
+    # a model that answers "moderate" every time scores ~0.59. Reporting accuracy
+    # against a hardcoded 1/3 chance would make a below-baseline result look like a
+    # pass. Macro recall (mean per-tier recall) is the metric that survives the skew.
+    from collections import Counter
+    correct, per_tier_hits, per_tier_n, n_asked = 0, Counter(), Counter(), 0
     for r in sample:
         try:
             guess = ask(r["text"])
         except Exception:
             continue
+        n_asked += 1
+        per_tier_n[r["tier"]] += 1
         if r["tier"] in guess:
             correct += 1
-    return {"n": len(sample), "accuracy": correct / len(sample) if sample else 0.0}
+            per_tier_hits[r["tier"]] += 1
+    if not n_asked:
+        return None
+    recalls = {t: per_tier_hits[t] / per_tier_n[t] for t in per_tier_n}
+    majority = max(per_tier_n.values()) / n_asked
+    return {"n": n_asked,
+            "accuracy": correct / n_asked,
+            "majority_baseline": round(majority, 4),
+            "macro_recall": round(sum(recalls.values()) / len(recalls), 4),
+            "per_tier_recall": {t: round(v, 4) for t, v in recalls.items()}}
 
 
 def main():
@@ -185,14 +202,29 @@ def main():
     if leaks:
         hard_fail.append(f"{len(leaks)} banned-lexicon leaks in implicit set")
 
-    # 2. Tier balance.
-    tier_counts = Counter(r["tier"] for r in (explicit + implicit))
-    total = sum(tier_counts.values()) or 1
-    shares = {t: c / total for t, c in tier_counts.items()}
-    expected = 1.0 / len(cfg["data"]["tiers"])
-    bal_ok = all(abs(s - expected) <= qc["tier_balance_tol"] for s in shares.values())
-    report["tier_balance"] = {"shares": shares, "expected": expected,
-                              "tol": qc["tier_balance_tol"], "pass": bal_ok}
+    # 2. Factor-cell balance.
+    #
+    # The blended tier is NOT balanced any more, on purpose: profiles are balanced
+    # over the willingness x capacity grid, and balancing a weighted sum cannot
+    # balance its parts, so the derived tier mix comes out near 28/58/13. Checking
+    # tier balance here would fail on correct data every run and train everyone to
+    # ignore QC. The grid is what must be flat, so that is what is checked; the tier
+    # mix is reported for information only.
+    rows_all = explicit + implicit
+    cell_counts = Counter(r.get("factor_cell") for r in rows_all if r.get("factor_cell"))
+    total = sum(cell_counts.values()) or 1
+    shares = {c: n / total for c, n in cell_counts.items()}
+    expected = 1.0 / len(cell_counts) if cell_counts else 0.0
+    bal_ok = bool(cell_counts) and all(
+        abs(s - expected) <= qc["tier_balance_tol"] for s in shares.values())
+    tier_counts = Counter(r["tier"] for r in rows_all)
+    tier_total = sum(tier_counts.values()) or 1
+    report["factor_cell_balance"] = {
+        "shares": shares, "expected": expected, "tol": qc["tier_balance_tol"],
+        "pass": bal_ok,
+        "derived_tier_mix": {t: c / tier_total for t, c in tier_counts.items()},
+        "conflicted_share": sum(bool(r.get("conflicted")) for r in rows_all) / tier_total,
+    }
 
     # 3. Token-length match across tiers & types.
     count_tokens, tok_name = get_token_counter()
@@ -231,9 +263,9 @@ def main():
     res_dir = Path(cfg["paths"]["results_dir"])
     res_dir.mkdir(parents=True, exist_ok=True)
     # Report filename tracks the vignettes dir so an edge run doesn't clobber the main one:
-    # data/vignettes -> s2_qc_report.json, data/vignettes_edge -> s2_qc_report_edge.json.
+    # data/vignettes -> qc_report.json, data/vignettes_edge -> s2_qc_report_edge.json.
     tag = re.sub(r"^vignettes_?", "", vdir.name)
-    report_path = res_dir / (f"s2_qc_report_{tag}.json" if tag else "s2_qc_report.json")
+    report_path = res_dir / (f"qc_report_{tag}.json" if tag else "qc_report.json")
     report_path.write_text(json.dumps(report, indent=2))
 
     def mark(b):
@@ -241,7 +273,13 @@ def main():
     print("=== S2B QC ===")
     print(f"counts: {report['counts']}")
     print(f"[{mark(not leaks)}] banned-lexicon leaks: {len(leaks)}")
-    print(f"[{mark(bal_ok)}] tier balance: {{ {', '.join(f'{t}:{s:.3f}' for t, s in shares.items())} }}")
+    fb = report["factor_cell_balance"]
+    print(f"[{mark(bal_ok)}] factor-cell balance: {len(shares)} cells, "
+          f"expected {fb['expected']:.3f} each, "
+          f"spread {min(shares.values(), default=0):.3f}-{max(shares.values(), default=0):.3f}")
+    print(f"       derived tier mix (informational, imbalance is intended): "
+          f"{{ {', '.join(f'{t}:{s:.3f}' for t, s in fb['derived_tier_mix'].items())} }}")
+    print(f"       conflicted share: {fb['conflicted_share']:.3f}")
     print(f"[{mark(len_ok)}] token length ({tok_name}): {means}")
     print(f"[{mark(dup_ok)}] near-dup fraction ({dup_method}): {frac:.4f} < {qc['dup_fraction_max']}")
     coh = report["age_experience_coherence"]
@@ -251,12 +289,23 @@ def main():
         print(f"[{mark(coh_ok)}] age/experience coherence: {coh['count']} young clients "
               f"asserting long investing tenure")
     if rt:
-        print(f"[----] round-trip tier recovery: {rt['accuracy']:.2f} on n={rt['n']} (chance ~0.33)")
+        beats = rt["accuracy"] >= rt["majority_baseline"]
+        print(f"[----] round-trip tier recovery: acc {rt['accuracy']:.2f} vs "
+              f"majority-guess {rt['majority_baseline']:.2f} "
+              f"({'above' if beats else 'BELOW'}), macro-recall {rt['macro_recall']:.2f} "
+              f"on n={rt['n']}")
+        print(f"       per-tier recall: {rt['per_tier_recall']}")
+        print( "       note: this asks for the BLENDED tier, which is a weighted sum of 8 "
+               "fields.")
+        print( "       Low recovery here is expected and is not a text-quality signal -- "
+               "see roundtrip.py")
+        print( "       for whether the individual FACTS survived, which is the thing QC "
+               "can actually act on.")
     else:
         print("[----] round-trip tier recovery: skipped (no API key)")
     print(f"report -> {report_path}")
 
-    soft = [n for n, ok in (("tier balance", bal_ok), ("token length", len_ok),
+    soft = [n for n, ok in (("factor-cell balance", bal_ok), ("token length", len_ok),
                             ("duplicates", dup_ok), ("age/experience coherence", coh_ok)) if not ok]
     if soft:
         print(f"SOFT WARNINGS: {', '.join(soft)}")

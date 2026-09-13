@@ -4,7 +4,7 @@ import json
 
 import numpy as np
 
-from s5_train_probes import (
+from probes import (
     consolidate, eval_probe, fit_logistic, fractional_depth, load_plane,
     make_splits, selectivity, split_indices,
 )
@@ -119,9 +119,12 @@ def test_probe_learns_signal_control_is_chance():
 
 # -- consolidate stitches shards into a memmap with aligned labels ---------------------
 def _write_shard(path, acts, labels):
-    keys = ["vignette_id", "profile_id", "pair_id", "tier", "risk_score",
-            "vignette_type", "contradictory"]
-    cols = {k: np.array([row[k] for row in labels], dtype=object) for k in keys}
+    """Shard columns come from label_row, so this fixture cannot drift from the
+    real schema when new label columns (factors, controls) are added."""
+    from activations import label_row
+    rows = [label_row({"text": "", "template_id": "t", "name": "n", **row})
+            for row in labels]
+    cols = {k: np.array([r[k] for r in rows], dtype=object) for k in rows[0]}
     np.savez(path, acts=acts.astype(np.float16), **cols)
 
 

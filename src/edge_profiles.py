@@ -12,7 +12,7 @@ hard corners of the rubric:
 Output: data/profiles_edge.jsonl  (same schema as S1's profiles.jsonl + an `edge_bucket`).
 
 Run S2 on it (separate output dir, no synthetic pairs):
-    python src/s2_render_vignettes.py --profiles data/profiles_edge.jsonl \
+    python src/vignettes.py --profiles data/profiles_edge.jsonl \
         --out-dir data/vignettes_edge --n-pairs 0
 """
 

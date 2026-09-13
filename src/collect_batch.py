@@ -1,7 +1,7 @@
 """S2 batch collector: poll an OpenAI batch, cache its results, then render + QC.
 
-Pairs with `python3 src/s2_render_vignettes.py --batch`, which submitted the uncached
-paraphrase jobs and wrote results/s2_batch_id.txt + results/s2_batch_sidecar.json.
+Pairs with `python3 src/vignettes.py --batch`, which submitted the uncached
+paraphrase jobs and wrote results/batch_id.txt + results/batch_sidecar.json.
 
 This script:
   1. polls the batch until it finishes (or is already done),
@@ -10,7 +10,7 @@ This script:
   3. runs the normal render (now an all-cache-hit, no-API pass) and the S2B QC gate.
 
 Usage:
-    python3 src/s2_collect_batch.py [--batch-id ID] [--poll-interval 60]
+    python3 src/collect_batch.py [--batch-id ID] [--poll-interval 60]
                                     [--profiles ...] [--out-dir ...] [--n-pairs N]
 """
 
@@ -38,13 +38,14 @@ def make_client(cfg):
         banned_words=banned, banned_regex=build_banned_regex(banned),
         cache_dir=Path(cfg["paths"]["cache_dir"]) / "paraphrase",
         temperature=pcfg["temperature"], max_retries=pcfg["max_retries"],
+        reasoning_effort=pcfg.get("reasoning_effort"),
     )
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--batch-id", default=None, help="default: read results/s2_batch_id.txt")
+    ap.add_argument("--batch-id", default=None, help="default: read results/batch_id.txt")
     ap.add_argument("--poll-interval", type=int, default=60, help="seconds between polls")
     # forwarded to the render pass so it matches what was submitted
     ap.add_argument("--profiles", default=None)
@@ -56,8 +57,8 @@ def main():
         cfg = yaml.safe_load(f)
     res_dir = Path(cfg["paths"]["results_dir"])
 
-    batch_id = args.batch_id or (res_dir / "s2_batch_id.txt").read_text().strip()
-    sidecar = json.loads((res_dir / "s2_batch_sidecar.json").read_text())
+    batch_id = args.batch_id or (res_dir / "batch_id.txt").read_text().strip()
+    sidecar = json.loads((res_dir / "batch_sidecar.json").read_text())
     client = make_client(cfg)
 
     # 1. poll ---------------------------------------------------------------------
@@ -85,8 +86,8 @@ def main():
               "Re-run --batch to submit the remainder, then collect again.")
 
     # 3. render (all-cache-hit) + QC ----------------------------------------------
-    render = [sys.executable, "src/s2_render_vignettes.py"]
-    qc = [sys.executable, "src/s2b_qc.py"]
+    render = [sys.executable, "src/vignettes.py"]
+    qc = [sys.executable, "src/qc.py"]
     for flag, val in (("--profiles", args.profiles), ("--out-dir", args.out_dir),
                       ("--n-pairs", args.n_pairs)):
         if val is not None:

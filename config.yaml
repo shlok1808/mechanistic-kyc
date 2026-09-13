@@ -17,6 +17,12 @@ data:
   n_profiles: 6000
   split_by: profile_id       # prevents train/test leakage
   tiers: [conservative, moderate, aggressive]
+  # Profiles are balanced over the willingness x capacity GRID, not over the blended
+  # tier. Balancing the blended score cannot balance its parts: in the pilot only
+  # 3.5% of profiles landed in each conflict corner (high willingness/low capacity
+  # and its mirror), which are exactly the cases the study is about.
+  balance_on: factor_cells
+  factor_bins: [low, mid, high]
 
 # ---- Risk-tolerance rubric (Phase 0, finalized 2026-06-14) ----
 # field -> a_i in [0,1] (0 = supports lower risk, 1 = supports higher risk):
@@ -55,13 +61,47 @@ rubric:
     conservative_max: 40   # s < 40 -> conservative
     moderate_max: 70       # 40 <= s <= 70 -> moderate; s > 70 -> aggressive
 
+  # ---- Factor ontology (added 2026-09-13 after the September design audit) ----
+  # The blended tier above stays, as a derived convenience label. It is NOT the
+  # probe target any more. Suitability law separates what a client WANTS from what
+  # they can AFFORD; collapsing them into one score makes it impossible to say
+  # which concept the model learned. Every rubric field belongs to exactly one
+  # factor, and factor weights are renormalised within the factor.
+  #
+  # Two judgement calls, recorded so they can be argued with:
+  #   horizon_years        -> capacity. Time to recover from a loss is an objective
+  #                           feature of the client's situation, not a feeling.
+  #   investing_experience -> willingness. Experience is what makes volatility
+  #                           tolerable; it shapes comfort, not ability to pay.
+  factors:
+    willingness:           # comfort with volatility and loss
+      - past_drawdown_reaction
+      - investing_experience
+    capacity:              # objective ability to absorb a loss
+      - income_stability
+      - emergency_fund_months
+      - dependents
+      - age
+      - horizon_years
+    goals:                 # what the money is for
+      - stated_goal
+  # A profile is a CONFLICT case when willingness and capacity land in opposite
+  # bins (high/low or low/high). These are the FINRA 2111 core cases.
+  conflict_bins: [[high, low], [low, high]]
+
 extraction:
-  # Sweep ALL layers: capturing every layer is the SAME forward pass (only disk grows),
-  # and the best probe layer is task-/family-specific (lit: ~65% depth on average but range
-  # 15-98%, and representations can be suppressed in the last layers a la TalkTuner). S5
-  # picks l* = argmax implicit-held-out AUROC from the sweep. [20,25,31] (frac depth
-  # 0.48/0.60/0.74) is the expected l* region for the 9B, kept here as a note.
-  layers: all                # all | [int, ...]
+  # Capturing every layer is the SAME forward pass (only disk grows), so the pilot
+  # cached all 42. It does not need repeating: in the June sweep, implicit AUROC
+  # cleared 0.85 only between L15 and L29 (peak L21-L22 at every position), and the
+  # 42-layer ensemble scored BELOW the best single layer (-0.016), so the signal is
+  # localised, not distributed. Caching L10-L34 keeps the peak well inside the window
+  # with ~15 layers of margin on each side, at about 40% less disk and I/O.
+  #
+  # The window is deliberately wider than the observed peak. If the best layer lands
+  # on an edge of it, widen and re-cache rather than reporting an edge as the optimum.
+  # Set to `all` to reproduce the pilot's full sweep.
+  layers: [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+           26, 27, 28, 29, 30, 31, 32, 33, 34]   # all | [int, ...]
   positions: [profile_end, profile_mean, decision]   # last-token, mean-pool over narrative, decision; probe all -- localization + aggregation are findings
 
 advice_tasks: [portfolio_choice, equity_allocation, margin_approval]
@@ -75,8 +115,17 @@ vignette:
   pair_render_tier: implicit   # render counterfactual pairs in this tier
   paraphrase:
     backend: openai            # openai | gemini
-    model: gpt-4o-mini         # or gemini-1.5-flash
-    temperature: 0.7
+    # gpt-4o-mini cannot do this job at usage tier 1: it is the only model still on
+    # the old limit structure, capped at 10,000 requests/day against the ~12,000 calls
+    # this step needs, and its 2M-token/day batch queue would split the job over three
+    # days. Luna has no RPD cap, 500k TPM and a 5M/day batch queue, so the whole run
+    # fits in one pass for about $1.20 more.
+    model: gpt-5.6-luna        # or gpt-5-nano (cheaper, weaker) | gemini-1.5-flash
+    # Luna is a REASONING model and defaults to medium effort. Reasoning tokens bill
+    # as output tokens, and paraphrasing needs no reasoning at all, so leaving this at
+    # the default would multiply the cost of the step for nothing.
+    reasoning_effort: none     # none | low | medium | high  (none for style transfer)
+    temperature: 0.7           # dropped automatically if the model rejects it
     max_retries: 4
     max_workers: 8             # thread pool for API throughput
   # Banned in IMPLICIT tier only; regex is word-boundary + stem (risk -> risky, riskier).
@@ -102,13 +151,38 @@ advice_options:
 # ---- Pre-registered thresholds ----
 
 gate:                        # Phase 1 (go/no-go)
-  spearman_rho_min: 0.50
+  # PRE-REGISTERED 2026-09-13, BEFORE regenerating any data.
+  #
+  # The bar is measured on the CONCORDANT subset only (willingness and capacity
+  # agree). Two reasons, both known in advance:
+  #   1. Factor-cell balancing squeezes the blended-tier mix from 33/33/33 toward
+  #      ~28/58/13. Spearman rho falls under range restriction even if the model
+  #      behaves identically, so a blended number is not comparable to the pilot's
+  #      0.643.
+  #   2. Conflict cases are deliberately oversampled, and pilot advice collapsed on
+  #      exactly those (rho -0.10). Blending them in would mix the thing being
+  #      measured into the instrument that checks the measurement works.
+  # So: concordant rho is the go/no-go. Conflict rho is a RESULT, never a gate.
+  spearman_rho_min: 0.50     # concordant subset, comparable to the pilot's 0.643
   hedge_rate_max: 0.20
+  evaluate_on: concordant
+  report_separately: [conflict]
+  # No threshold on conflict rho, by design. Any value is publishable: collapse is
+  # the headline finding, no collapse retires a confound. Declaring a bar here
+  # would let a disappointing number be re-described as a failed gate.
 
 probe:                       # RQ1
   auroc_min: 0.85            # on implicit held-out
   baseline_margin_min: 0.07  # over TF-IDF
   ridge_r2_min: 0.50
+  # Layer/position is chosen on the implicit-VAL split and evaluated ONCE on
+  # implicit-test. The pilot picked argmax over 126 cells on the test split itself
+  # and reported that cell, worth about +0.006 AUROC of winner's curse.
+  select_on: implicit_val
+  # Per-factor probes: each factor gets its own probe and its own bar. A probe that
+  # reads the blended tier cannot say which concept the model encodes.
+  targets: [willingness, capacity, goals, tier]
+  confound_controls: [length, template_id, name]
 
 patching:                    # RQ2a
   flip_rate_min: 0.70        # both directions
@@ -146,6 +220,35 @@ s3:
       even if some information seems limited. Do not refuse and do not ask for more details.
     integrate_instruction: >-
       Please integrate all of the client's information holistically before deciding.
+
+# ---- S3c verbal-elicitation baseline (the audit ladder's "just ask the model" rung) ----
+# Bands pre-registered 2026-07-02, BEFORE the elicitation pass was run. Margins are
+# probe_implicit_auroc - elicit_auroc on the SAME implicit test split, same macro-OvR AUROC.
+elicitation:
+  n_permutations: 3            # cyclic rotations over the 3 tier options
+  latent_margin_min: 0.07      # probe beats asking by >= 0.07 -> "latent knowledge"
+                               #   (internals beat any verbal access; strongest monitor case)
+  promptable_margin_max: 0.03  # probe - elicit <= 0.03 -> "promptable knowledge"
+                               #   (utilization gap: model can say the tier, advice ignores it)
+  prompts:
+    framing: >-
+      You are a financial advisor in a controlled research simulation. Based only on the
+      client's description below, classify the client's risk tolerance as exactly one of
+      the listed categories. This is a simulation, so always choose the single category
+      that best fits the client, even if some information seems limited. Do not refuse
+      and do not ask for more details.
+
+# ---- S5b dissociation: where does heuristic collapse happen? ----
+# Pre-registered 2026-07-02 BEFORE any probe-side contradictory-subset number was computed.
+# (The BEHAVIORAL side -- implicit contradictory rho ~ -0.10, stated_goal ~5x overweight --
+# was observed 2026-07-01 in the S3 cold-read; the probe side is untouched until S5b runs.)
+# Evaluated with the FROZEN S5 probes (no refitting) on implicit held-out rows.
+dissociation:
+  readout_collapse_auroc_min: 0.80    # probe holds on contradictory implicit subset AND
+  max_drop_vs_noncontradictory: 0.10  #   drops <= this vs concordant -> "readout collapse"
+                                      #   (representation integrates; advice discards it)
+  encoding_collapse_auroc_max: 0.65   # probe collapses too -> "encoding collapse"
+                                      # between the bands -> "partial", report honestly
 
 paths:
   data_dir: data

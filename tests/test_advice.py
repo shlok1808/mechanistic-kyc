@@ -2,11 +2,11 @@
 
 import yaml
 
-from s3_advice import (
+from advice import (
     aggregate_allocation_probs, aggressiveness, build_user_message, cyclic_permutations,
     is_hedged, slot_options,
 )
-from s3_gate import compute_gate
+from gate import compute_gate
 
 
 ALLOCS = ["80% bonds, 20% stocks", "60% bonds, 40% stocks",

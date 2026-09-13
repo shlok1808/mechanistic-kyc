@@ -23,12 +23,23 @@ from pathlib import Path
 
 from templates import find_banned
 
+# The "add nothing" half of this prompt is load-bearing. The pilot told the model to
+# KEEP every fact but never told it to INVENT none, so it elaborated qualitative
+# statements into quantitative ones: "I've been through several market cycles" became
+# "I've been investing for 20 years", which QC then flagged on 56 clients under 30.
+# Preservation and non-invention are separate instructions and both have to be given.
 _SYSTEM = (
     "You rewrite a first-person description a person gives of themselves and their "
     "finances. Keep every concrete fact (ages, numbers, timelines, family, job, money "
     "amounts, how they reacted to past market moves). Change only wording and sentence "
-    "flow so it reads naturally and a little differently. Return ONLY the rewritten "
-    "paragraph, first person, no preamble."
+    "flow so it reads naturally and a little differently.\n"
+    "Add NOTHING. Do not introduce any number, duration, date, age, count or money "
+    "amount that is not already stated in the text. In particular, never convert a "
+    "vague description of experience into a specific span of years: if the text says "
+    "someone has been through market cycles, do not say how many years they have been "
+    "investing. Do not add opinions, motives, job details or family details that are "
+    "not there. Keep one sentence per fact and do not merge or split them.\n"
+    "Return ONLY the rewritten paragraph, first person, no preamble."
 )
 _IMPLICIT_RULE = (
     " Hard rule: do NOT use any of these words or variants of them: {banned}. Convey the "
@@ -40,9 +51,18 @@ class ParaphraseClient:
     """Backend-agnostic paraphraser with a disk cache and banned-term retries."""
 
     def __init__(self, backend, model, banned_words, banned_regex, cache_dir,
-                 temperature=0.7, max_retries=4, max_workers=8, enabled=True):
+                 temperature=0.7, max_retries=4, max_workers=8, enabled=True,
+                 reasoning_effort=None):
         self.backend = backend
         self.model = model
+        # Reasoning models (the GPT-5 family, o-series) bill reasoning tokens as
+        # output. Paraphrasing is style transfer and needs none, so this is passed as
+        # "none" rather than left at the model default.
+        self.reasoning_effort = reasoning_effort
+        # Params some models reject outright (reasoning models often refuse a custom
+        # temperature). On the first rejection the offending param is dropped for the
+        # rest of the run instead of failing every one of ~12,000 calls.
+        self._unsupported = set()
         self.banned_words = banned_words
         self.banned_regex = banned_regex
         self.temperature = temperature
@@ -72,6 +92,32 @@ class ParaphraseClient:
         else:
             raise ValueError(f"unknown backend {self.backend!r}")
 
+    def _openai_kwargs(self):
+        """Optional params, minus any this model has already rejected."""
+        kw = {}
+        if "temperature" not in self._unsupported:
+            kw["temperature"] = self.temperature
+        if self.reasoning_effort and "reasoning_effort" not in self._unsupported:
+            kw["reasoning_effort"] = self.reasoning_effort
+        return kw
+
+    def _note_unsupported(self, err):
+        """If the API rejected an optional param, drop it for the rest of the run.
+
+        Returns True when something was dropped, i.e. the call is worth retrying.
+        """
+        msg = str(err).lower()
+        dropped = False
+        for param in ("temperature", "reasoning_effort"):
+            if param not in self._unsupported and param in msg and (
+                    "unsupported" in msg or "not supported" in msg
+                    or "unknown" in msg or "does not support" in msg
+                    or "invalid" in msg):
+                self._unsupported.add(param)
+                print(f"    note: {self.model} rejected '{param}'; continuing without it")
+                dropped = True
+        return dropped
+
     def _call(self, prompt):
         self._ensure_client()
         for attempt in range(4):
@@ -86,20 +132,33 @@ class ParaphraseClient:
                     return r.text.strip()
                 else:  # openai
                     r = self._client.chat.completions.create(
-                        model=self.model, temperature=self.temperature,
+                        model=self.model,
                         messages=[{"role": "system", "content": _SYSTEM},
                                   {"role": "user", "content": prompt}],
+                        **self._openai_kwargs(),
                     )
                     return r.choices[0].message.content.strip()
-            except Exception:
+            except Exception as e:
+                if self.backend != "gemini" and self._note_unsupported(e):
+                    continue        # retry immediately without the rejected param
                 if attempt == 3:
                     raise
                 time.sleep(2 ** attempt)
 
     # -- caching -----------------------------------------------------------------
     def _cache_id(self, mode, text):
-        """Stable id for (mode, source text) -- also used as the Batch API custom_id."""
-        return hashlib.sha1(f"{self.backend}|{self.model}|{mode}|{text}".encode()).hexdigest()
+        """Stable id for (prompt, mode, source text) -- also the Batch API custom_id.
+
+        The prompt digest is part of the key. Without it, editing _SYSTEM leaves every
+        existing cache entry looking valid, so a re-run silently serves text generated
+        under the OLD instructions -- the same stale-cache trap the activation cache
+        had. Changing the prompt now simply misses the cache, which is correct.
+        """
+        prompt_digest = hashlib.sha1(
+            (_SYSTEM + "|" + _IMPLICIT_RULE + "|" + ",".join(self.banned_words)).encode()
+        ).hexdigest()[:10]
+        return hashlib.sha1(
+            f"{self.backend}|{self.model}|{prompt_digest}|{mode}|{text}".encode()).hexdigest()
 
     def _cache_path(self, mode, text):
         return self.cache_dir / f"{self._cache_id(mode, text)}.json"
@@ -172,9 +231,10 @@ class ParaphraseClient:
             seen.add(cid)
             lines.append({
                 "custom_id": cid, "method": "POST", "url": "/v1/chat/completions",
-                "body": {"model": self.model, "temperature": self.temperature,
+                "body": {"model": self.model,
                          "messages": [{"role": "system", "content": _SYSTEM},
-                                      {"role": "user", "content": self._build_prompt(mode, text)}]},
+                                      {"role": "user", "content": self._build_prompt(mode, text)}],
+                         **self._openai_kwargs()},
             })
             sidecar[cid] = {"mode": mode, "source": text}
         return lines, sidecar
