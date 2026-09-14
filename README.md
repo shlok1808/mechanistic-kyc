@@ -5,7 +5,8 @@ Looking inside an LLM financial advisor to audit *Know Your Customer* (suitabili
 **Thesis:** Behavioral testing can show an AI advisor gave bad advice. Only mechanistic
 (internal) testing shows *why* — and the *why* determines the fix.
 
-> Status: direction pending team-sync confirmation (June 2026). Target: ICAIF 2026 (Aug 2).
+> Status: redesigned September 2026 after the project review (see below). Data
+> regenerated and quality-checked; model runs next.
 
 ## Project review
 
