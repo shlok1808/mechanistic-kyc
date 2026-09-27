@@ -311,6 +311,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--n-boot", type=int, default=2000)
+    ap.add_argument("--model", default=None, help="override config model.primary")
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
