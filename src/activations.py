@@ -161,9 +161,9 @@ def next_shard_index(shard_dir):
 def write_shard(shard_dir, idx, acts, labels):
     """Write one .npz: acts[n,L,P,d] fp16 + parallel label columns."""
     import numpy as np
-    keys = ["vignette_id", "profile_id", "pair_id", "tier", "risk_score",
-            "vignette_type", "contradictory"]
-    cols = {k: np.array([row[k] for row in labels], dtype=object) for k in keys}
+    # every column label_row() builds; a hard-coded pilot-era list here once dropped the
+    # factor targets, so probes had to recover them from the vignette files
+    cols = {k: np.array([row[k] for row in labels], dtype=object) for k in labels[0]}
     out = Path(shard_dir) / f"shard_{idx:04d}.npz"
     np.savez(out, acts=np.asarray(acts, dtype=np.float16), **cols)
     return out

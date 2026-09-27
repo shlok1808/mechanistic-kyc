@@ -175,3 +175,21 @@ def test_consolidate_rebuilds_when_a_shard_is_added(tmp_path):
     os.utime(tmp_path / "shard_0001.npz", (1 << 31, 1 << 31))   # ensure it's newer than acts_all
     acts2, labels2, _ = consolidate(tmp_path)
     assert acts2.shape[0] == 12 and len(labels2) == 12          # rebuilt, not the stale 5
+
+
+def test_fill_missing_labels_joins_on_vignette_id(tmp_path):
+    import json
+    from probes import fill_missing_labels
+    (tmp_path / "implicit.jsonl").write_text(
+        json.dumps({"vignette_id": "v1", "factor_cell": "low/high", "willingness": 0.1, "tier": "WRONG"}) + "\n")
+    out = fill_missing_labels([{"vignette_id": "v1", "tier": "moderate"}],
+                              ["vignette_id", "tier", "factor_cell", "willingness"], tmp_path)
+    assert out == [{"vignette_id": "v1", "tier": "moderate", "factor_cell": "low/high", "willingness": 0.1}]
+
+
+def test_fill_missing_labels_raises_on_unknown_row(tmp_path):
+    import pytest
+    from probes import fill_missing_labels
+    (tmp_path / "implicit.jsonl").write_text("")
+    with pytest.raises(KeyError):
+        fill_missing_labels([{"vignette_id": "ghost"}], ["vignette_id", "tier"], tmp_path)

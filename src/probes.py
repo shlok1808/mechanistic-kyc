@@ -136,7 +136,28 @@ def load_meta(act_dir):
     return json.loads((Path(act_dir) / "meta.json").read_text())
 
 
-def consolidate(act_dir):
+def fill_missing_labels(labels, label_keys, vignette_dir):
+    """Complete label rows from the vignette files, joined on vignette_id.
+
+    Caches written before activations.write_shard saved every label column carry only
+    the pilot-era keys; the factor targets live in data/vignettes/*.jsonl. Values
+    already present in a shard are never overwritten.
+    """
+    if all(k in lab for lab in labels for k in label_keys):
+        return labels
+    by_id = {}
+    for f in sorted(Path(vignette_dir).glob("*.jsonl")):
+        for line in open(f):
+            v = json.loads(line)
+            by_id[v["vignette_id"]] = v
+    missing = [lab["vignette_id"] for lab in labels if lab["vignette_id"] not in by_id]
+    if missing:
+        raise KeyError(f"{len(missing)} cached rows have no vignette record, e.g. {missing[:3]}")
+    return [{k: lab[k] if k in lab else by_id[lab["vignette_id"]].get(k) for k in label_keys}
+            for lab in labels]
+
+
+def consolidate(act_dir, vignette_dir="data/vignettes"):
     """Build (once) a memmapped acts_all.npy [N,L,P,d] + labels.jsonl from the S4 shards.
 
     Returns (acts_memmap, labels_list, meta). Re-runs are no-ops once the consolidated files
@@ -179,9 +200,11 @@ def consolidate(act_dir):
         with np.load(sh, allow_pickle=True) as z:
             a = z["acts"]
             acts[off:off + a.shape[0]] = a
+            present = [k for k in label_keys if k in z.files]
             for r in range(a.shape[0]):
-                labels.append({k: _py(z[k][r]) for k in label_keys})
+                labels.append({k: _py(z[k][r]) for k in present})
             off += a.shape[0]
+    labels = fill_missing_labels(labels, label_keys, vignette_dir)
     acts.flush()
     with open(labels_path, "w") as f:
         for lab in labels:
@@ -425,7 +448,7 @@ def factor_probe_sweep(acts_path, acts, labels, idx, cells, cfg_layers, position
 def run(cfg, args):
     act_dir = Path(args.activations or
                    Path(cfg["paths"]["results_dir"]) / "activations" / "gemma-2-9b-it")
-    acts, labels, meta = consolidate(act_dir)
+    acts, labels, meta = consolidate(act_dir, cfg["paths"]["vignettes_dir"])
     cfg_layers, positions_all = meta["layers"], meta["positions"]
     n_layers_model = meta["num_hidden_layers"]
 
