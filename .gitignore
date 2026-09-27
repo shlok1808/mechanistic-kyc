@@ -40,3 +40,4 @@ archive/
 
 # progress reports: unpublished results, submit directly rather than publishing
 reports/
+.lambda_instance

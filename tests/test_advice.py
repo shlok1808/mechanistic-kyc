@@ -139,3 +139,128 @@ def test_two_condition_paired_delta():
     rep = compute_gate(rows, cfg)
     assert rep["two_condition"]["n_pairs"] == 20
     assert abs(rep["two_condition"]["mean_delta"] - (-0.10)) < 1e-9
+
+
+# -- checkpoint / resume ---------------------------------------------------------------
+def test_unit_key_changes_with_model_and_prompt():
+    from advice import unit_key
+    assert unit_key("m", "p") == unit_key("m", "p")
+    assert unit_key("m", "p") != unit_key("m", "p ")
+    assert unit_key("m", "p") != unit_key("m2", "p")
+
+
+def test_load_checkpoint_skips_torn_last_line(tmp_path):
+    import json
+    from advice import load_checkpoint
+    p = tmp_path / "ckpt.jsonl"
+    p.write_text(json.dumps({"k": "a", "r": [[0.25] * 4, 0.9, True]}) + "\n" + '{"k": "b", "r": [[0.2')
+    assert load_checkpoint(p) == {"a": ([0.25] * 4, 0.9, True)}
+    assert load_checkpoint(tmp_path / "missing.jsonl") == {}
+
+
+def test_run_resumes_after_crash_without_rescoring(tmp_path, monkeypatch):
+    """Crash partway, re-run: only unscored prompts hit the model, output matches a clean run."""
+    import json
+    from argparse import Namespace
+    import advice
+
+    cfg = yaml.safe_load(open("config.yaml"))
+    cfg["paths"]["results_dir"] = str(tmp_path / "results")
+    cfg["paths"]["vignettes_dir"] = str(tmp_path / "vig")
+    cfg["s3"]["batch_size"] = 2
+    (tmp_path / "vig").mkdir()
+    vigs = [{"vignette_id": f"v{i}", "profile_id": f"p{i}", "vignette_type": "implicit",
+             "tier": cfg["data"]["tiers"][i % len(cfg["data"]["tiers"])], "risk_score": 0.5,
+             "contradictory": i == 0, "text": f"client {i} " * (i + 1)} for i in range(5)]
+    (tmp_path / "vig" / "implicit.jsonl").write_text("".join(json.dumps(v) + "\n" for v in vigs))
+
+    def fake_score(tok, model, prompts, letter_ids):
+        calls.extend(prompts)
+        if crash_after is not None and len(calls) > crash_after:
+            raise RuntimeError("simulated crash")
+        n = len(letter_ids)
+        lp = [[(len(p) % 7 + k + 1) / 10 for k in range(n)] for p in prompts]
+        lp = [[x / sum(r) for x in r] for r in lp]
+        return lp, [0.95] * len(prompts), [True] * len(prompts)
+
+    monkeypatch.setattr(advice, "load_model", lambda *a, **k: (None, None))
+    monkeypatch.setattr(advice, "make_prompt", lambda tok, msg: msg)
+    monkeypatch.setattr(advice, "resolve_letter_token_ids", lambda tok, p, n: list(range(n)))
+    monkeypatch.setattr(advice, "score_prompts", fake_score)
+    args = Namespace(dry_run=False, model="fake/model", device="cpu", batch_size=None, shard=None)
+    n_prompts = 6 * cfg["s3"]["n_permutations"]      # 5 baseline + 1 instruction row
+
+    calls, crash_after = [], 8
+    try:
+        advice.run(cfg, args)
+        assert False, "expected simulated crash"
+    except RuntimeError:
+        pass
+    scored_before_crash = 8
+
+    calls, crash_after = [], None
+    advice.run(cfg, args)
+    assert len(calls) == n_prompts - scored_before_crash
+    resumed = open(tmp_path / "results" / "model" / "advice.jsonl").read()
+
+    # clean run in a fresh results dir must give identical rows
+    cfg["paths"]["results_dir"] = str(tmp_path / "clean")
+    calls = []
+    advice.run(cfg, args)
+    assert len(calls) == n_prompts
+    assert open(tmp_path / "clean" / "model" / "advice.jsonl").read() == resumed
+
+
+def test_parse_shard():
+    from advice import parse_shard
+    import pytest
+    assert parse_shard(None) == (0, 1)
+    assert parse_shard("2/8") == (2, 8)
+    for bad in ("8/8", "-1/4", "0/0"):
+        with pytest.raises(ValueError):
+            parse_shard(bad)
+
+
+def test_sharded_run_merges_to_same_output(tmp_path, monkeypatch):
+    """3 shards then an unsharded merge: every prompt scored exactly once, output identical
+    to a single-process run, and dry-run checkpoints are never picked up."""
+    import json
+    from argparse import Namespace
+    import advice
+
+    cfg = yaml.safe_load(open("config.yaml"))
+    cfg["paths"]["vignettes_dir"] = str(tmp_path / "vig")
+    (tmp_path / "vig").mkdir()
+    vigs = [{"vignette_id": f"v{i}", "profile_id": f"p{i}", "vignette_type": "implicit",
+             "tier": cfg["data"]["tiers"][i % len(cfg["data"]["tiers"])], "risk_score": 0.5,
+             "contradictory": i < 2, "text": f"client {i} " * (i + 1)} for i in range(7)]
+    (tmp_path / "vig" / "implicit.jsonl").write_text("".join(json.dumps(v) + "\n" for v in vigs))
+    calls = []
+
+    def fake_score(tok, model, prompts, letter_ids):
+        calls.extend(prompts)
+        lp = [[(len(p) % 5 + k + 1) for k in range(len(letter_ids))] for p in prompts]
+        return [[x / sum(r) for x in r] for r in lp], [0.9] * len(prompts), [True] * len(prompts)
+
+    monkeypatch.setattr(advice, "load_model", lambda *a, **k: (None, None))
+    monkeypatch.setattr(advice, "make_prompt", lambda tok, msg: msg)
+    monkeypatch.setattr(advice, "resolve_letter_token_ids", lambda tok, p, n: list(range(n)))
+    monkeypatch.setattr(advice, "score_prompts", fake_score)
+    mk = lambda shard: Namespace(dry_run=False, model="fake/model", device="cpu",
+                                 batch_size=3, shard=shard)
+
+    cfg["paths"]["results_dir"] = str(tmp_path / "sharded")
+    (tmp_path / "sharded" / "model").mkdir(parents=True)
+    (tmp_path / "sharded" / "model" / "advice_checkpoint_dryrun.jsonl").write_text("garbage\n")
+    for i in range(3):
+        advice.run(cfg, mk(f"{i}/3"))
+    n_prompts = len(calls)
+    assert len(set(calls)) == n_prompts == 9 * cfg["s3"]["n_permutations"]
+    calls.clear()
+    advice.run(cfg, mk(None))
+    assert calls == []                                  # merge scores nothing
+    sharded = open(tmp_path / "sharded" / "model" / "advice.jsonl").read()
+
+    cfg["paths"]["results_dir"] = str(tmp_path / "single")
+    advice.run(cfg, mk(None))
+    assert open(tmp_path / "single" / "model" / "advice.jsonl").read() == sharded

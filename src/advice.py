@@ -17,6 +17,10 @@ two-condition experiment.
 The torch/transformers imports are lazy so the pure scoring logic is unit-testable on a
 machine without a GPU or PyTorch.
 
+Every scored batch is appended to results/<model>/advice_checkpoint.jsonl, keyed on a hash
+of model + exact prompt. Re-running the same command after a crash resumes from it. With --shard i/N (one process
+per GPU) each shard writes its own checkpoint; a final unsharded run merges them.
+
 Usage:
     python src/advice.py [--config config.yaml] [--dry-run] [--model ID] [--device cuda]
 """
@@ -130,7 +134,13 @@ def score_prompts(tok, model, prompts, letter_ids):
     import torch
     enc = tok(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(model.device)
     with torch.inference_mode():
-        logits = model(**enc).logits[:, -1, :].float()
+        # only the last position is read; skipping the other [T, 256k-vocab] logit rows is
+        # identical numerically and frees several GB per batch for larger batches
+        try:
+            out = model(**enc, logits_to_keep=1)
+        except TypeError:                           # older transformers
+            out = model(**enc, num_logits_to_keep=1)
+        logits = out.logits[:, -1, :].float()
     full = torch.softmax(logits, dim=-1)
     cols = full[:, letter_ids]                                  # [B, n]
     letter_probs = cols / cols.sum(dim=-1, keepdim=True).clamp_min(1e-9)
@@ -144,6 +154,43 @@ def score_prompts(tok, model, prompts, letter_ids):
 def batched(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
+
+
+def unit_key(model_id, prompt):
+    """Checkpoint key: the exact model + prompt text. Any change to the prompt, framing,
+    options or vignette text yields a new key, so a resume can never reuse a stale score."""
+    from utils.paths import text_digest
+    return text_digest(model_id, prompt, length=16)
+
+
+def parse_shard(spec):
+    """'i/N' -> (i, N), 0-based. None -> (0, 1)."""
+    if not spec:
+        return 0, 1
+    i, n = (int(x) for x in spec.split("/"))
+    if not (n >= 1 and 0 <= i < n):
+        raise ValueError(f"bad shard {spec!r}: need 0 <= i < N")
+    return i, n
+
+
+def checkpoint_paths(res_dir, suffix):
+    """Every checkpoint for this run: the unsharded one plus any shard files."""
+    return sorted(Path(res_dir).glob(f"advice_checkpoint{suffix}.*jsonl"))
+
+
+def load_checkpoint(path):
+    """{key: (letter_probs, p_letters, argmax_is_letter)} from an append-only jsonl.
+    A torn last line (crash mid-write) is skipped, not fatal."""
+    done = {}
+    if not Path(path).exists():
+        return done
+    for line in open(path):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        done[row["k"]] = tuple(row["r"])
+    return done
 
 
 # --------------------------------------------------------------------------------------
@@ -214,16 +261,45 @@ def run(cfg, args):
     letter_ids = resolve_letter_token_ids(tok, prompts[0], n)
     print(f"model={model_id}  letter token ids={letter_ids}")
 
+    # results/<model>/ -- the model is the directory, never the filename, so a 2B
+    # dev run can never overwrite a 9B production run.
+    from utils.paths import run_dir
+    res_dir = run_dir(cfg, model_id)
+    suffix = "_dryrun" if args.dry_run else ""
+
+    # checkpoint: every scored batch is appended, so a crash loses at most one batch
+    # sharding: shard i of N scores every N-th prompt into its own checkpoint file and
+    # stops. An unsharded run afterwards finds all prompts scored and just writes output.
+    shard_i, shard_n = parse_shard(args.shard)
+    tag = f".shard{shard_i}of{shard_n}" if shard_n > 1 else ""
+    ckpt_path = res_dir / f"advice_checkpoint{suffix}{tag}.jsonl"
+    keys = [unit_key(model_id, p) for p in prompts]
+    done = {}
+    for path in checkpoint_paths(res_dir, suffix):
+        done.update(load_checkpoint(path))
+    results = [done.get(k) for k in keys]
+    n_resumed = sum(r is not None for r in results)
+    if n_resumed:
+        print(f"resuming: {n_resumed}/{len(prompts)} prompts already scored")
+
     # sort by length for batching efficiency; remember original order
-    order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
-    results = [None] * len(prompts)
-    for batch_idx in batched(order, s3["batch_size"]):
-        bp = [prompts[i] for i in batch_idx]
-        lp, pl, aml = score_prompts(tok, model, bp, letter_ids)
-        for j, i in enumerate(batch_idx):
-            results[i] = (lp[j], pl[j], aml[j])
-        print(f"  scored {sum(r is not None for r in results)}/{len(prompts)}", end="\r")
+    order = sorted((i for i in range(len(prompts))
+                    if results[i] is None and i % shard_n == shard_i),
+                   key=lambda i: len(prompts[i]))
+    batch_size = args.batch_size or s3["batch_size"]
+    with open(ckpt_path, "a") as ckpt:
+        for batch_idx in batched(order, batch_size):
+            bp = [prompts[i] for i in batch_idx]
+            lp, pl, aml = score_prompts(tok, model, bp, letter_ids)
+            for j, i in enumerate(batch_idx):
+                results[i] = (lp[j], pl[j], aml[j])
+                ckpt.write(json.dumps({"k": keys[i], "r": results[i]}) + "\n")
+            ckpt.flush()
+            print(f"  scored {sum(r is not None for r in results)}/{len(prompts)}", end="\r")
     print()
+    if shard_n > 1:
+        print(f"shard {shard_i}/{shard_n} done -> {ckpt_path}. Run without --shard to merge.")
+        return
 
     # group units by (vid, cond) -> aggregate over perms
     groups = {}
@@ -256,11 +332,6 @@ def run(cfg, args):
             "p_letters": round(p_letters_mean, 5), "hedged": bool(hedged),
         })
 
-    # results/<model>/ -- the model is the directory, never the filename, so a 2B
-    # dev run can never overwrite a 9B production run.
-    from utils.paths import run_dir
-    res_dir = run_dir(cfg, model_id)
-    suffix = "_dryrun" if args.dry_run else ""
     out_path = res_dir / f"advice{suffix}.jsonl"
     with open(out_path, "w") as f:
         for r in out_rows:
@@ -287,6 +358,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--model", default=None, help="override config model.primary (e.g. google/gemma-2-2b-it)")
     ap.add_argument("--device", default="cuda", help="cuda | cpu")
+    ap.add_argument("--batch-size", type=int, default=None, help="override config s3.batch_size")
+    ap.add_argument("--shard", default=None, help="i/N: score only every N-th prompt (0-based i)")
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
