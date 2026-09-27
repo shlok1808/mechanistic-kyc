@@ -193,3 +193,25 @@ def test_fill_missing_labels_raises_on_unknown_row(tmp_path):
     (tmp_path / "implicit.jsonl").write_text("")
     with pytest.raises(KeyError):
         fill_missing_labels([{"vignette_id": "ghost"}], ["vignette_id", "tier"], tmp_path)
+
+
+def test_factor_probe_sweep_runs_end_to_end(tmp_path):
+    """Smoke test the per-factor sweep on a tiny synthetic cache. Its joblib import was
+    once missing and the first real run crashed after 11 minutes of tier sweep."""
+    import numpy as np
+    from probes import factor_probe_sweep
+    rng = np.random.default_rng(0)
+    n, d = 120, 6
+    cells_lab = ["low/low", "high/high", "low/high"]
+    labels = [{"willingness": float(i % 3) / 2, "factor_cell": cells_lab[i % 3]} for i in range(n)]
+    acts = rng.normal(size=(n, 1, 1, d)).astype(np.float16)
+    acts[:, 0, 0, 0] += np.array([i % 3 for i in range(n)], dtype=np.float16)  # learnable signal
+    path = tmp_path / "acts_all.npy"
+    np.save(path, acts)
+    ids = np.arange(n)
+    idx = {"train": ids[:60], "val": ids[60:75], "explicit_test": ids[75:90],
+           "implicit_val": ids[90:105], "implicit_test": ids[105:]}
+    out = factor_probe_sweep(str(path), acts, labels, idx, [(0, "decision", 5)], [5],
+                             ["decision"], 12, ["willingness", "factor_cell"], seed=0, n_jobs=1)
+    assert set(out) == {"willingness", "factor_cell"}
+    assert out["factor_cell"]["layer"] == 5 and 0.0 <= out["factor_cell"]["implicit_auroc"] <= 1.0

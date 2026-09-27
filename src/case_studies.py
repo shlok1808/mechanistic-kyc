@@ -125,6 +125,41 @@ def percentile_of(value, population):
     return float(100 * np.mean(np.asarray(population) <= value))
 
 
+
+def probe_section(name, row, profile, pool, profiles, readout_by_vid, heldout, probe_meta):
+    """Markdown for layer 3: what the frozen tier probe reads from the activations for this
+    client, next to what the advice did. Group means use held-out (val+test) profiles only,
+    so no number comes from a client whose twin trained the probe."""
+    vid = row["vignette_id"]
+    r = readout_by_vid.get(vid)
+    L = ["## 5. Internal readout (probe)", "",
+         f"Frozen tier probe `{probe_meta['file']}` (layer {probe_meta['layer']}, {probe_meta['position']}), "
+         "trained on EXPLICIT vignettes only. Readout = p(aggressive) - p(conservative), range -1 to +1.", ""]
+    if r is None:
+        return "\n".join(L + ["_No cached activation for this vignette._", ""])
+    p = r["proba"]
+    L += ["| | Conservative | Moderate | Aggressive | Readout |", "|---|---|---|---|---|",
+          f"| Probe on this client | {p['conservative']:.2f} | {p['moderate']:.2f} | {p['aggressive']:.2f} | {r['readout']:+.2f} |",
+          "", f"- True tier: **{row['tier']}**. Probe's top guess: **{max(p, key=p.get)}**. "
+              f"Advice riskiness: **{row['aggressiveness']:.3f}**.",
+          f"- This client's profile is in the probe's **{r['split']}** split"
+          + (" (its explicit twin trained the probe; treat as in-sample)." if r["split"] == "train" else " (held out)."), ""]
+    if name.startswith("say_vs_did"):
+        goal = profile["stated_goal"]
+        L += [f"**Knowing vs acting**, all held-out implicit clients who say **{fmt_val('', goal)}**:", "",
+              "| Crash behavior | Mean ADVICE | Mean PROBE readout | n |", "|---|---|---|---|"]
+        for d in ["sold_everything", "reduced", "held", "bought_more"]:
+            g = [x for x in pool if x["vignette_id"] in heldout and x["vignette_id"] in readout_by_vid
+                 and profiles[x["profile_id"]]["stated_goal"] == goal
+                 and profiles[x["profile_id"]]["past_drawdown_reaction"] == d]
+            if g:
+                L.append(f"| {fmt_val('', d)} | {np.mean([x['aggressiveness'] for x in g]):.3f} | "
+                         f"{np.mean([readout_by_vid[x['vignette_id']]['readout'] for x in g]):+.3f} | {len(g)} |")
+        L += ["", "If the probe readout moves with crash behavior more than the advice does, the model "
+                  "registers the behavior internally and the advice fails to use it (readout failure). "
+                  "If both stay flat, the behavior never made it into the representation (encoding failure).", ""]
+    return "\n".join(L)
+
 # --------------------------------------------------------------------------------------
 # Rendering
 # --------------------------------------------------------------------------------------
@@ -157,7 +192,7 @@ def option_labels(cfg):
 
 
 def case_markdown(name, spec, row, profile, text, resid_i, pred_i, resid_all, pool, profiles,
-                  effects, similar, twin_row, cfg, shifts_note=None):
+                  effects, similar, twin_row, cfg, shifts_note=None, probe_ctx=None):
     labels = option_labels(cfg)
     L = [f"# Case: {name.replace('_', ' ')}", "",
          f"**Why this case:** {WHY.get(name, '')}", "",
@@ -214,9 +249,12 @@ def case_markdown(name, spec, row, profile, text, resid_i, pred_i, resid_all, po
     L.append("")
     if shifts_note:
         L += [shifts_note, ""]
-    L += ["## 5. Internal readout (probe)", "",
-          "_Pending: filled in after `probes.py` and `dissociation.py` run. Question: at the best layer, "
-          "does the probe decode this client's willingness and capacity correctly, even where the advice ignores them?_", ""]
+    if probe_ctx is not None:
+        L += [probe_section(name, row, profile, pool, profiles, *probe_ctx)]
+    else:
+        L += ["## 5. Internal readout (probe)", "",
+              "_Pending: run `case_studies.py --with-probe` after `probes.py`. Question: does the probe "
+              "decode this client correctly even where the advice ignores the evidence?_", ""]
     return "\n".join(L)
 
 
@@ -271,6 +309,28 @@ def load_jsonl(path):
     return [json.loads(l) for l in open(path)]
 
 
+def load_probe_context(cfg, res, pool):
+    """(readout_by_vid, heldout_vids, probe_meta) for the frozen best tier probe."""
+    from dissociation import _latest_cache, continuous_readout, load_probe_npz, probe_predict_proba
+    from probes import consolidate, load_plane, make_splits
+    cands = sorted((res / "weights").glob("probe_best_*.npz"))
+    if not cands:
+        raise FileNotFoundError(f"no probe_best_*.npz in {res / 'weights'} -- run probes.py first")
+    probe = load_probe_npz(cands[0])
+    acts, labels, meta = consolidate(_latest_cache(res), cfg["paths"]["vignettes_dir"])
+    plane = load_plane(acts, meta["layers"].index(probe["layer"]), meta["positions"].index(probe["position"]))
+    proba = probe_predict_proba(probe, plane)
+    ro = continuous_readout(proba, probe["classes"])
+    split = make_splits([lab["profile_id"] for lab in labels], seed=cfg["seed"])
+    out = {}
+    for i, lab in enumerate(labels):
+        out[lab["vignette_id"]] = {"proba": dict(zip(probe["classes"], map(float, proba[i]))),
+                                   "readout": float(ro[i]), "split": split[lab["profile_id"]]}
+    heldout = {v for v, r in out.items() if r["split"] in ("val", "test")}
+    meta_p = {"file": cands[0].name, "layer": probe["layer"], "position": probe["position"]}
+    return out, heldout, meta_p
+
+
 def run(cfg, args):
     cs = cfg["case_studies"]
     res = run_dir(cfg, args.model or cfg["model"]["primary"])
@@ -295,6 +355,8 @@ def run(cfg, args):
     (out / "pair_effects.json").write_text(json.dumps(effects, indent=2, sort_keys=True))
     effects_figure(out / "counterfactual_effects.png", effects)
 
+    probe_ctx = load_probe_context(cfg, res, pool) if args.with_probe else None
+
     band = cs["similar_risk_band"]
     index = []
     for name, spec in cs["archetypes"].items():
@@ -303,7 +365,8 @@ def run(cfg, args):
         similar = [r for r in pool if abs(r["risk_score"] - row["risk_score"]) <= band]
         md = case_markdown(name, spec, row, profiles[row["profile_id"]], texts[row["vignette_id"]],
                            float(resid[i]), float(slope * row["risk_score"] + intercept), resid, pool,
-                           profiles, effects, similar, explicit.get(row["profile_id"]), cfg)
+                           profiles, effects, similar, explicit.get(row["profile_id"]), cfg,
+                           probe_ctx=probe_ctx)
         (out / f"case_{name}.md").write_text(md)
         case_figure(out / f"case_{name}.png", name, row, similar, cfg)
         index.append((name, row["vignette_id"], row["aggressiveness"], float(resid[i])))
@@ -349,6 +412,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--model", default=None, help="override config model.primary")
+    ap.add_argument("--with-probe", action="store_true", help="fill section 5 from the frozen best probe")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config))
     run(cfg, args)

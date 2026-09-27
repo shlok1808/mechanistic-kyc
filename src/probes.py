@@ -413,6 +413,7 @@ def factor_probe_sweep(acts_path, acts, labels, idx, cells, cfg_layers, position
     `factor_cell` (willingness x capacity, 9 classes) is used as-is: it is the target that
     requires integrating two factors jointly, pre-registered 2026-09-13 as the headline.
     """
+    from joblib import Parallel, delayed
     from rubric import BINS, factor_bin
     out = {}
     for factor in factors:
@@ -570,7 +571,8 @@ def run(cfg, args):
     # ---- per-factor probes + confound controls ----
     factor_probes = factor_probe_sweep(
         acts_path, acts, labels, idx, cells, cfg_layers, positions, n_layers_model,
-        [f for f in cfg["probe"].get("targets", []) if f != "tier"], cfg["seed"], n_jobs)
+        [f for f in (args.targets.split(",") if args.targets else cfg["probe"].get("targets", []))
+         if f != "tier"], cfg["seed"], n_jobs)
     controls = confound_baselines(labels, idx, tier, seed=cfg["seed"])
 
     # ---- thresholds (pre-registered) ----
@@ -650,6 +652,8 @@ def main():
     ap.add_argument("--seeds", type=int, default=5, help="split-seed count for stability at l*")
     ap.add_argument("--n-jobs", type=int, default=None, help="parallel sweep workers (default: CPUs-2)")
     ap.add_argument("--no-ensemble", action="store_true", help="skip the multi-layer stacking row")
+    ap.add_argument("--targets", default=None,
+                    help="comma list overriding probe.targets for the per-factor sweep (e.g. 'tier' = tier sweep only)")
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
