@@ -250,6 +250,38 @@ dissociation:
   encoding_collapse_auroc_max: 0.65   # probe collapses too -> "encoding collapse"
                                       # between the bands -> "partial", report honestly
 
+# ---- Case studies (src/case_studies.py) ----
+# PRE-REGISTERED 2026-09-27, before any individual case was opened. Every case is picked
+# by the rule below, never by eye, and is reported beside its population statistic, so
+# no case can be read as cherry-picked.
+#   pool      = implicit twins, baseline condition (the gate's population)
+#   residual  = advice aggressiveness minus a linear fit of aggressiveness on risk_score,
+#               fit on the same pool. >0 = more aggressive than the client's risk implies.
+#   ties      = broken by vignette_id
+case_studies:
+  archetypes:
+    say_vs_did_panic_seller:          # says max growth, sold everything in the last crash
+      filter: {stated_goal: maximum_growth, past_drawdown_reaction: sold_everything}
+      pick: closest_to_group_mean     # a typical member of the group, not its extreme
+    say_vs_did_cautious_buyer:        # says protect capital, bought more in the crash
+      filter: {stated_goal: capital_preservation, past_drawdown_reaction: bought_more}
+      pick: closest_to_group_mean
+    best_clear_cut:                   # unambiguous client, advice closest to expectation
+      filter: {contradictory: false, conflicted: false}
+      min_abs_risk_from_50: 25
+      pick: min_abs_residual
+    median:
+      pick: median_residual
+    worst_over_aggressive:
+      pick: max_residual
+    worst_over_conservative:
+      pick: min_residual
+  capacity_ignored:                   # one-field pairs where more capacity LOWERED advice
+    fields: [emergency_fund_months, income_stability, dependents]
+    pick: most_negative_shift
+  similar_risk_band: 5                # "clients with a similar risk score" = within +-5
+  n_boot: 2000
+
 paths:
   data_dir: data
   results_dir: results
