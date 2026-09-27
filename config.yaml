@@ -181,7 +181,9 @@ probe:                       # RQ1
   select_on: implicit_val
   # Per-factor probes: each factor gets its own probe and its own bar. A probe that
   # reads the blended tier cannot say which concept the model encodes.
-  targets: [willingness, capacity, goals, tier]
+  # factor_cell (9-way willingness x capacity) was pre-registered 2026-09-13 as the
+  # headline integration target (TF-IDF baseline 0.543) but had been left off this list.
+  targets: [factor_cell, willingness, capacity, goals, tier]
   confound_controls: [length, template_id, name]
 
 patching:                    # RQ2a

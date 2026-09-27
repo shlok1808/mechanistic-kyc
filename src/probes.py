@@ -387,13 +387,18 @@ def factor_probe_sweep(acts_path, acts, labels, idx, cells, cfg_layers, position
     willingness" from "the model tracks their capacity" -- the blended label mixes
     both. Each factor is binned into low/mid/high and gets its own sweep and its own
     dev-selected (layer, position); where a factor peaks is itself a result.
+    `factor_cell` (willingness x capacity, 9 classes) is used as-is: it is the target that
+    requires integrating two factors jointly, pre-registered 2026-09-13 as the headline.
     """
     from rubric import BINS, factor_bin
     out = {}
     for factor in factors:
         if factor not in labels[0]:
             continue
-        y = np.array([factor_bin(float(lab[factor]), BINS) for lab in labels])
+        if factor == "factor_cell":           # already a 9-way low/mid/high x low/mid/high label
+            y = np.array([lab[factor] for lab in labels])
+        else:
+            y = np.array([factor_bin(float(lab[factor]), BINS) for lab in labels])
         if len(set(y[idx["train"]])) < 2 or len(set(y[idx["implicit_val"]])) < 2:
             continue
         results = Parallel(n_jobs=n_jobs)(
