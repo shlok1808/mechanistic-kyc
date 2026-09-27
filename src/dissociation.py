@@ -157,12 +157,13 @@ def _latest_cache(res_dir):
 
 
 def run(cfg, args):
+    model_id = args.model or cfg["model"]["primary"]
     res_dir = run_dir(cfg, model_id)
     tag = model_tag(cfg["model"]["primary"])
     act_dir = Path(args.activations) if args.activations else _latest_cache(res_dir)
 
     try:
-        acts, labels, meta = consolidate(act_dir)
+        acts, labels, meta = consolidate(act_dir, cfg["paths"]["vignettes_dir"])
     except FileNotFoundError:
         print(f"S5b: no activation shards in {act_dir}.\n"
               f"  This analysis needs the S4 cache (Lambda box). Runbook:\n"
@@ -330,6 +331,7 @@ def main():
     ap.add_argument("--activations", default=None, help="S4 cache dir (results/activations/<tag>)")
     ap.add_argument("--probe", default=None, help="probe npz override (default: probe_best_*.npz)")
     ap.add_argument("--n-boot", type=int, default=2000)
+    ap.add_argument("--model", default=None, help="override config model.primary")
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
