@@ -247,7 +247,7 @@ def run(cfg, args):
     n = len(allocation_texts)
     permutations = cyclic_permutations(n, s3["n_permutations"])
 
-    vignettes = load_vignettes(cfg["paths"]["vignettes_dir"])
+    vignettes = load_vignettes(getattr(args, "vignettes_dir", None) or cfg["paths"]["vignettes_dir"])
     if args.dry_run:
         vignettes = stratified_sample(vignettes, s3["dry_run_n"], cfg["seed"])
     print(f"S3: {len(vignettes)} vignettes "
@@ -265,7 +265,7 @@ def run(cfg, args):
     # dev run can never overwrite a 9B production run.
     from utils.paths import run_dir
     res_dir = run_dir(cfg, model_id)
-    suffix = "_dryrun" if args.dry_run else ""
+    suffix = ("_dryrun" if args.dry_run else "") + (getattr(args, "suffix", None) or "")
 
     # checkpoint: every scored batch is appended, so a crash loses at most one batch
     # sharding: shard i of N scores every N-th prompt into its own checkpoint file and
@@ -360,6 +360,8 @@ def main():
     ap.add_argument("--device", default="cuda", help="cuda | cpu")
     ap.add_argument("--batch-size", type=int, default=None, help="override config s3.batch_size")
     ap.add_argument("--shard", default=None, help="i/N: score only every N-th prompt (0-based i)")
+    ap.add_argument("--vignettes-dir", default=None, help="override paths.vignettes_dir (e.g. data/vignettes_edge)")
+    ap.add_argument("--suffix", default=None, help="output name suffix, e.g. _edge -> advice_edge.jsonl")
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)

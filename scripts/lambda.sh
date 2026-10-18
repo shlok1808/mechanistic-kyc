@@ -9,6 +9,8 @@
 #   scripts/lambda.sh setup       # venv + deps + HF login on the box
 #   scripts/lambda.sh dryrun      # 100-vignette smoke pass (few minutes)
 #   scripts/lambda.sh advice      # full advice run inside tmux session "advice"
+#   scripts/lambda.sh batch       # steering + elicitation + edge + side effects, all GPUs
+#   scripts/lambda.sh status      # last lines of every batch log + GPU use
 #   scripts/lambda.sh log         # tail the run log
 #   scripts/lambda.sh pull        # copy results/ back to the Mac
 #   scripts/lambda.sh terminate   # kill the instance (stops billing)
@@ -19,7 +21,7 @@ set -euo pipefail
 API="https://cloud.lambda.ai/api/v1"
 KEY="$HOME/.ssh/lambda_final"
 STATE=".lambda_instance"            # gitignored-by-dotfile convention; holds "id ip"
-PREFER=(gpu_1x_h100_sxm5 gpu_1x_h100_pcie gpu_1x_gh200 gpu_1x_a100_sxm4 gpu_1x_a100 gpu_1x_a10)
+PREFER=(${TYPE:-} gpu_1x_h100_sxm5 gpu_1x_h100_pcie gpu_1x_gh200 gpu_1x_a100_sxm4 gpu_1x_a100 gpu_1x_a10)
 REMOTE_DIR="mechanistic-kyc"
 # Lambda's driver supports CUDA 12.8; default PyPI torch targets a newer CUDA and fails
 # with "NVIDIA driver too old". Override with TORCH_CUDA=cu130 etc. if the image changes.
@@ -52,7 +54,7 @@ launch)
   fi
 
   id=$(api -X POST "$API/instance-operations/launch" -H 'Content-Type: application/json' \
-    -d "{\"region_name\":\"$region\",\"instance_type_name\":\"$pick\",\"ssh_key_names\":[\"$keyname\"],\"quantity\":1,\"name\":\"kyc-advice\"}" \
+    -d "{\"region_name\":\"$region\",\"instance_type_name\":\"$pick\",\"ssh_key_names\":[\"$keyname\"],\"quantity\":1,\"name\":\"kyc-gpu\"}" \
     | python3 -c "import json,sys;print(json.load(sys.stdin)['data']['instance_ids'][0])")
   echo "Launched $id -- waiting for it to boot (usually 2-5 min)..."
   while :; do
@@ -67,6 +69,12 @@ sync)
   rsh "mkdir -p $REMOTE_DIR"
   rsync -az -e "ssh -i $KEY" --exclude __pycache__ \
     src scripts config.yaml requirements.txt conftest.py tests data "ubuntu@$(ip):$REMOTE_DIR/"
+  # small inputs the GPU stages read from results/ (steering directions, ~1 MB)
+  if [ -f results/gemma-2-9b-it/steering/directions.npz ]; then
+    rsh "mkdir -p $REMOTE_DIR/results/gemma-2-9b-it/steering"
+    rsync -az -e "ssh -i $KEY" results/gemma-2-9b-it/steering/directions.npz \
+      "ubuntu@$(ip):$REMOTE_DIR/results/gemma-2-9b-it/steering/"
+  fi
   echo "Synced to $(ip):$REMOTE_DIR"
   ;;
 setup)
@@ -85,6 +93,13 @@ advice)
   rsh "cd $REMOTE_DIR && tmux new -d -s advice 'bash scripts/run_advice.sh ${BATCH:-128}'"
   echo "Running in tmux session 'advice'. Watch: scripts/lambda.sh log"
   echo "Attach: ssh -i $KEY ubuntu@$(ip) -t tmux attach -t advice   (detach: Ctrl+B D)"
+  ;;
+batch)
+  rsh "cd $REMOTE_DIR && tmux new -d -s batch 'bash scripts/run_gpu_batch.sh ${BATCH:-64} 2>&1 | tee logs_batch.txt'"
+  echo "Running in tmux session 'batch'. Watch: scripts/lambda.sh status"
+  ;;
+status)
+  rsh "cd $REMOTE_DIR && for f in logs/*.log; do echo \"== \$f\"; tail -c 400 \$f | tr '\\r' '\\n' | tail -2; done; nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader"
   ;;
 log)
   rsh "tail -c 2000 $REMOTE_DIR/advice.log | tr '\r' '\n' | tail -5"

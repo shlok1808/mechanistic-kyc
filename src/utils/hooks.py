@@ -4,8 +4,10 @@ This is the one piece of real infrastructure in the project: thin context manage
 PyTorch forward hooks on `model.model.layers[i]`. Every downstream interp script is a
 consumer of this module, which is what keeps the components swappable.
 
-`residual_cache` is what S4 needs and is implemented here. `patch` / `steer` land with
-S6 / S7 (kept out for now so this module stays small and only ships what is tested).
+`residual_cache` (S4), `steer` (S7 steering, S8 self-vs-client) and `patch` (S6) all edit or
+read the same site: the hidden state a decoder layer returns, i.e. the residual stream after
+that block. Hooks registered later see the output of hooks registered earlier, so a
+`residual_cache` opened inside a `steer` block records the steered stream.
 
 torch is imported lazily inside the context managers so this file is importable on a box
 without PyTorch (the pure offset logic in s4 lives there, not here).
@@ -41,3 +43,68 @@ def residual_cache(model, layers):
     finally:
         for h in handles:
             h.remove()
+
+
+def _hidden(out):
+    """The hidden state inside a decoder layer's return value (tuple or bare tensor)."""
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _replace_hidden(out, h):
+    """`out` with its hidden state swapped for `h`, keeping the original structure."""
+    return (h,) + tuple(out[1:]) if isinstance(out, tuple) else h
+
+
+@contextmanager
+def steer(model, layer, vector, alpha):
+    """Add `alpha * vector` to the residual stream after decoder layer `layer`, at every
+    position (prompt and any generated tokens).
+
+    The sum is taken in float32 and cast back, so a small dose is not lost to bf16
+    rounding. `alpha == 0` registers nothing, which makes the unsteered baseline
+    bit-identical to a plain forward pass.
+    """
+    import torch
+    if alpha == 0:
+        yield
+        return
+    delta = alpha * torch.as_tensor(vector, dtype=torch.float32)
+
+    def hook(_module, _inp, out):
+        h = _hidden(out)
+        steered = (h.float() + delta.to(h.device)).to(h.dtype)
+        return _replace_hidden(out, steered)
+
+    handle = model.model.layers[layer].register_forward_hook(hook)
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
+@contextmanager
+def patch(model, layer, rows, positions, donor):
+    """Overwrite the residual after decoder layer `layer` at (rows[k], positions[k]) with
+    `donor[k]`, for every k. Positions index the PADDED batch, so callers add each row's
+    left-pad count first.
+
+    Applies to the forward pass that matches the batch shape it was built for; it is meant
+    for single scoring passes, not generation.
+    """
+    import torch
+    rows_t = torch.as_tensor(rows, dtype=torch.long)
+    pos_t = torch.as_tensor(positions, dtype=torch.long)
+    donor_t = torch.as_tensor(donor)
+    if not (len(rows_t) == len(pos_t) == len(donor_t)):
+        raise ValueError("rows, positions and donor must have the same length")
+
+    def hook(_module, _inp, out):
+        h = _hidden(out).clone()
+        h[rows_t.to(h.device), pos_t.to(h.device)] = donor_t.to(h.device, h.dtype)
+        return _replace_hidden(out, h)
+
+    handle = model.model.layers[layer].register_forward_hook(hook)
+    try:
+        yield
+    finally:
+        handle.remove()

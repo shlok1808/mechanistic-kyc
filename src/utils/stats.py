@@ -37,8 +37,11 @@ def macro_ovr_auroc(y_true, y_score, labels):
     if len(labels) == 2:
         pos = labels[1]
         return float(roc_auc_score((y_true == pos).astype(int), y_score[:, 1]))
-    return float(roc_auc_score(y_true, y_score, multi_class="ovr",
-                               average="macro", labels=labels))
+    # sklearn insists `labels` be sorted; permute the score columns to match rather than
+    # making every caller pass classes in alphabetical order
+    order = sorted(range(len(labels)), key=lambda i: labels[i])
+    return float(roc_auc_score(y_true, y_score[:, order], multi_class="ovr",
+                               average="macro", labels=[labels[i] for i in order]))
 
 
 def partial_spearman(x, y, control):
