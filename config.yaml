@@ -188,6 +188,15 @@ probe:                       # RQ1
 
 patching:                    # RQ2a
   flip_rate_min: 0.70        # both directions
+  # ---- Operational definitions, PRE-REGISTERED 2026-10-01, before any patching run ----
+  # One-field pairs (data/vignettes/pairs.jsonl), both directions, 4-perm readout.
+  layers: [10, 16, 22, 28, 34]
+  # sites: profile_end (last narrative token) and post_profile (every token after the
+  # narrative; identical text in both members, so positions align exactly)
+  min_behavior_gap: 0.05     # eligible pair: members' advice differs by >= this
+  flip_effect_min: 0.5       # flip: patched advice moves >= half way from base to donor
+  # headline site = best min-over-directions flip rate on EVEN pair ids; the reported
+  # flip rate is measured on ODD pair ids (no selection bias)
 
 steering:                    # RQ2b
   dose_spearman_min: 0.80    # on >= 2/3 tasks, flat random-direction control
@@ -195,6 +204,32 @@ steering:                    # RQ2b
     mmlu_delta_max: 2.0
     ppl_ratio_max: 1.05
     refusal_delta_max: 0.05
+  # ---- Operational definitions, PRE-REGISTERED 2026-10-01, before any steering run ----
+  # The bars above date from June; these lines fix HOW they are measured (src/steering.py).
+  # Only portfolio_choice is implemented, so ">= 2/3 tasks" reduces to the one task.
+  layer: probe_best          # the tier probe's dev-selected cell (L22 @ profile_mean)
+  position: probe_best
+  directions: [tier, willingness, capacity, goals]   # diff-in-means, high minus low class
+  # fit on train-split profiles only (explicit + implicit renderings, pairs excluded);
+  # evaluated on implicit-test vignettes, which no direction ever saw
+  doses: [-8, -4, -2, 0, 2, 4, 8]   # multiples of each direction's own class-mean gap (the
+                             # spec grid; the tier gap is ~3% of a token's norm, so +-8 = ~26%)
+  n_random: 5                # random directions, length matched to the tier gap
+  eval_per_tier: 100         # implicit-test vignettes per tier (stratified, seeded)
+  eval_add_contradictory: true   # plus every say-vs-did implicit-test vignette
+  control_n: 99              # random directions run on a stratified 33-per-tier subset
+  # dose-response rho = Spearman(dose, aggressiveness) per vignette, averaged over
+  # vignettes (bootstrap CI). Pass: tier mean rho >= dose_spearman_min.
+  # "Flat" control: EVERY random direction's full-range shift (mean advice at the top
+  # dose minus the bottom dose) is at most this fraction of the tier direction's.
+  # AMENDED 2026-10-01 after a 3-vignette dry run, before any real run: the first draft
+  # used |mean rho| <= 0.30, but rank correlation ignores size, so a random push moving
+  # advice by 0.01 scored |rho| ~0.9. Flatness is a magnitude question.
+  control_shift_ratio_max: 0.25
+  side_effect_doses: [-8, -4, -2, 2, 4, 8]   # tier direction; safe range = largest |dose| at
+                                      # which every dose up to it passes all three bars
+  mmlu_n: 500
+  ppl_chunks: 100            # WikiText-2 test, 512-token chunks
 
 self_vs_client:              # RQ2c (novelty)
   cosine_distinct_max: 0.50   # distinct directions
