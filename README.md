@@ -38,7 +38,25 @@ Each stage is one script in `src/`, named for what it does.
 | `probes.py` | Per-factor linear probes (RQ1), dev-selected layer/position |
 | `dissociation.py` | Is a collapse in the readout or in the encoding? |
 | `elicit.py` | Verbal-elicitation baseline: just ask the model |
+| `baselines.py` | TF-IDF baseline trained on implicit stories (the fair lexical opponent) |
+| `probe_implicit.py` | Like-for-like probe: trained and tested on implicit stories |
+| `steering.py`, `patching.py` | Causal tests: dose-response steering with random controls; one-field patching |
+| `patching_fields.py`, `patching_figure.py` | Patching flip rate by profile field; layer curve |
+| `self_vs_client.py` | Is the client-risk direction distinct from the model's own risk taste? |
+| `splits.py` | Export the 70/10/20 profile split (train / dev / held-out test) |
 | `report.py`, `figures.py` | Advisor packet and publication figures |
+
+## Changes to the parent method
+The parent paper is TalkTuner (Chen et al., 2024, arXiv:2406.07882), which reads user
+attributes with a linear probe. We changed two blocks, each with a prediction written
+before the run:
+- **Probe block** (`probes.py`, `probe_implicit.py`, `baselines.py`): test on stories with
+  the risk words removed; pick the layer on a dev split, not the test split; probe each
+  part of risk tolerance (willingness, capacity, goals) separately; compare with TF-IDF
+  trained on the same stories.
+- **Intervention block** (`steering.py`, `patching.py`, `self_vs_client.py`): steering at
+  seven doses with length-matched random directions and side-effect checks; patching on
+  pairs that differ in one field; a self-vs-client direction comparison.
 
 ## The client model
 Suitability law separates what a client **wants** from what they can **afford**, so the
