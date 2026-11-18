@@ -20,8 +20,11 @@ set -euo pipefail
 
 API="https://cloud.lambda.ai/api/v1"
 KEY="$HOME/.ssh/lambda_final"
-STATE=".lambda_instance"            # gitignored-by-dotfile convention; holds "id ip"
-PREFER=(${TYPE:-} gpu_1x_h100_sxm5 gpu_1x_h100_pcie gpu_1x_gh200 gpu_1x_a100_sxm4 gpu_1x_a100 gpu_1x_a10)
+STATE="${STATE:-.lambda_instance}"  # gitignored-by-dotfile convention; holds "id ip"
+                                    # (STATE=.lambda_instance_b to drive a second box)
+# an explicit TYPE is the ONLY candidate: falling back would launch a box nobody asked for
+if [ -n "${TYPE:-}" ]; then PREFER=("$TYPE"); else
+PREFER=(gpu_1x_h100_sxm5 gpu_1x_h100_pcie gpu_1x_gh200 gpu_1x_a100_sxm4 gpu_1x_a100 gpu_1x_a10); fi
 REMOTE_DIR="mechanistic-kyc"
 # Lambda's driver supports CUDA 12.8; default PyPI torch targets a newer CUDA and fails
 # with "NVIDIA driver too old". Override with TORCH_CUDA=cu130 etc. if the image changes.
@@ -75,13 +78,20 @@ sync)
     rsync -az -e "ssh -i $KEY" results/gemma-2-9b-it/steering/directions.npz \
       "ubuntu@$(ip):$REMOTE_DIR/results/gemma-2-9b-it/steering/"
   fi
+  if [ -f results/gemma-2-9b-it/self_vs_client/ids.json ]; then   # RQ2c fit/eval ids
+    rsh "mkdir -p $REMOTE_DIR/results/gemma-2-9b-it/self_vs_client"
+    rsync -az -e "ssh -i $KEY" results/gemma-2-9b-it/self_vs_client/ids.json \
+      "ubuntu@$(ip):$REMOTE_DIR/results/gemma-2-9b-it/self_vs_client/"
+  fi
   echo "Synced to $(ip):$REMOTE_DIR"
   ;;
 setup)
-  rsh "cd $REMOTE_DIR && python3 -m venv ~/kyc-venv && source ~/kyc-venv/bin/activate \
-    && pip install -q --upgrade pip \
-    && pip install -q torch --index-url https://download.pytorch.org/whl/${TORCH_CUDA:-cu128} \
-    && pip install -q -r requirements.txt \
+  # uv instead of pip: same venv path, several times faster to resolve and install
+  rsh "cd $REMOTE_DIR && (command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh) \
+    && export PATH=\$HOME/.local/bin:\$PATH \
+    && uv venv -q --allow-existing ~/kyc-venv && source ~/kyc-venv/bin/activate \
+    && uv pip install -q torch --index-url https://download.pytorch.org/whl/${TORCH_CUDA:-cu128} \
+    && uv pip install -q -r requirements.txt \
     && mkdir -p ~/.cache/huggingface && (umask 077; echo '${HF_TOKEN:?set HF_TOKEN}' > ~/.cache/huggingface/token) \
     && python -c 'import torch;print(\"cuda\",torch.cuda.is_available(),torch.cuda.get_device_name(0))' \
     && python -m pytest -q"

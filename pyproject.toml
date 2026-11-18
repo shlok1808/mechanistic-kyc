@@ -1,0 +1,31 @@
+[project]
+name = "mechanistic-kyc"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.15.0",
+    "datasets>=5.1.0",
+    "datasketch>=2.0.0",
+    "einops>=0.8.2",
+    "huggingface-hub>=2.4.0",
+    "matplotlib>=3.11.2",
+    "numpy>=2.4.6",
+    "pandas>=3.1.0",
+    "pytest>=9.2.0",
+    "pyyaml>=6.0.3",
+    "sae-lens>=6.54.14",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.17.1",
+    "sentencepiece>=0.2.2",
+    "torch>=2.15.0",
+    "tqdm>=4.70.1",
+    "transformer-lens>=3.9.0",
+    "transformers>=5.22.1",
+    "wandb>=0.31.0",
+]
+
+[dependency-groups]
+agent = ["scribe @ git+https://github.com/goodfire-ai/scribe.git@981047904e8ef874dc200689d9f2286afc779219"]
+
+[tool.uv]
+default-groups = ["agent"]

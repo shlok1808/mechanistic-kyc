@@ -83,6 +83,33 @@ def steer(model, layer, vector, alpha):
 
 
 @contextmanager
+def steer_from(model, layer, vector, alpha, starts):
+    """Like `steer`, but only at positions >= starts[b] in row b (PADDED batch indices).
+    Used to push a direction on the tokens after the client narrative only, so the client's
+    own tokens are read unsteered. Meant for single scoring passes of one batch shape.
+    """
+    import torch
+    if alpha == 0:
+        yield
+        return
+    delta = alpha * torch.as_tensor(vector, dtype=torch.float32)
+    starts_t = torch.as_tensor(starts, dtype=torch.long)
+
+    def hook(_module, _inp, out):
+        h = _hidden(out)
+        pos = torch.arange(h.shape[1], device=h.device)
+        mask = (pos[None, :] >= starts_t.to(h.device)[:, None]).unsqueeze(-1)   # [B, T, 1]
+        steered = (h.float() + mask * delta.to(h.device)).to(h.dtype)
+        return _replace_hidden(out, steered)
+
+    handle = model.model.layers[layer].register_forward_hook(hook)
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
+@contextmanager
 def patch(model, layer, rows, positions, donor):
     """Overwrite the residual after decoder layer `layer` at (rows[k], positions[k]) with
     `donor[k]`, for every k. Positions index the PADDED batch, so callers add each row's

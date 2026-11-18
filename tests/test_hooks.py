@@ -99,3 +99,29 @@ def test_patch_rejects_ragged_inputs(tiny):
     with pytest.raises(ValueError):
         with patch(model, 0, [0, 1], [3], torch.zeros(2, 32)):
             pass
+
+
+def test_steer_from_leaves_earlier_positions_untouched(tiny):
+    from utils.hooks import steer_from
+    model, ids = tiny
+    v = torch.randn(32)
+    with residual_cache(model, [1]) as plain, torch.inference_mode():
+        model(input_ids=ids)
+    with steer_from(model, 1, v, 2.0, [4, 6]), residual_cache(model, [1]) as moved, torch.inference_mode():
+        model(input_ids=ids)
+    diff = moved[1].float() - plain[1].float()
+    assert torch.allclose(diff[0, :4], torch.zeros(4, 32), atol=1e-6)
+    assert torch.allclose(diff[1, :6], torch.zeros(6, 32), atol=1e-6)
+    assert torch.allclose(diff[0, 4:], (2.0 * v).expand(5, 32), atol=1e-5)
+    assert torch.allclose(diff[1, 6:], (2.0 * v).expand(3, 32), atol=1e-5)
+
+
+def test_steer_from_at_zero_matches_full_steer(tiny):
+    from utils.hooks import steer_from
+    model, ids = tiny
+    v = torch.randn(32)
+    with steer(model, 1, v, 3.0):
+        full = _logits(model, ids)
+    with steer_from(model, 1, v, 3.0, [0, 0]):
+        masked = _logits(model, ids)
+    assert torch.allclose(full, masked, atol=1e-5)

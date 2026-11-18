@@ -274,6 +274,156 @@ self_vs_client:              # RQ2c (novelty)
   # OR cross-steer conflation. Anything else = PARTIAL OVERLAP, reported as such.
   # Known confound: a persona prompt may evoke the concept "a risky person" in general.
   # Cosine alone cannot rule that out; the cross-steering table is the deciding test.
+  # ---- AMENDMENT 2026-11-03, before any lottery item or RQ2c direction was scored. ----
+  # Three independent hostile reviews (2x Fable, 1x Opus, two rounds, reviewers saw each
+  # other's attacks) found the 10-20 design could not reach either verdict honestly:
+  # (1) a persona vector may just mean "a risky person is described"; (2) self and client
+  # directions were measured in different contexts, so low cosine came for free;
+  # (3) own-gap doses and the off/on rule were not comparable across directions or tasks;
+  # (4) |dose| 8 is past the certified safe range (RQ2b side effects: PPL fails at 8), and
+  # breakage drifts both readouts toward uniform, which fakes conflation; (5) rank-only
+  # gates pass on a floor; (6) n was too small for any verdict but PARTIAL.
+  # Everything below SUPERSEDES the 10-20 block where they conflict. Scope of the claim:
+  # an INSTRUCTED self risk attitude, not the model's default taste.
+  amended:
+    lotteries:
+      scales: [100, 150, 200, 250, 300, 400, 500, 600, 750, 1000, 1200, 1500, 2000, 2500,
+               3000, 4000, 5000, 6000, 7500, 10000, 15000, 20000, 30000, 50000]   # 24 (was 8)
+      drop_dominated: true     # S >= X is not a risk choice (p .9 x ratio 1.15)
+      split_unit: cell         # (p, ratio) cell; verbal items split separately, own row
+    pilot_scales: [120, 900, 3500, 25000]   # pilot only, disjoint from the real scales
+    # Directions, all at L22 (plus a curve over L10-34), two contexts:
+    #  lottery context (mean over the OPTION-LINE tokens, identical across prefixes):
+    #    S_lot  "You are a risk-seeking / cautious person ..."  (choose for yourself)
+    #    C_lot  "Your client is a risk-seeking / cautious person ..." (recommend for client)
+    #    N_lot  "You are a person who loves cats / dogs."   (irrelevant self null)
+    #  advisor context (mean over the client-narrative tokens, same as the cache):
+    #    S_adv  "You, the advisor, are personally a risk-seeking / cautious person ..."
+    #    N_adv  cats / dogs, same frame
+    #  client: willingness PRIMARY (deviation from 10-20: tier blends capacity and goals,
+    #    which have no self analogue), tier secondary. Steering uses the RQ2b vectors;
+    #    cosine uses an implicit_train refit, required cos(refit, RQ2b) >= 0.9.
+    #  S_perp (S with C_lot projected out) is REPORTED ONLY, never in a verdict.
+    fit_vignettes: 300         # implicit-train, tier-stratified (advisor-context fit)
+    eval_vignettes: 600        # implicit-test, tier-stratified (advice task)
+    advice_permutations: 2     # rotations 0 and 2; shifts are paired within vignette
+    doses_k: [-4, -2, -1, 0, 1, 2, 4]   # shared ABSOLUTE grid: unit vector x k x 13.4
+    dose_unit_norm: 13.4075    # the RQ2b tier gap norm; same for every direction
+    n_random: 5                # norm-matched, on both tasks, at k = +-4
+    hedge_max_dose0: 0.20      # G0
+    hedge_max_any_dose: 0.10   # common |k|max = largest k passing this for EVERY
+                               # direction on BOTH tasks; verdict must agree with hedged
+                               # rows included and excluded
+    gates:
+      G1_within_cell_rho_max: -0.50   # mean over (p, scale) of Spearman(ratio, P(gamble)),
+                                      # unprompted, all real items
+      G1_slope_min: 0.15              # mean over (p, scale) of P(gamble) at the lowest
+                                      # minus at the highest ratio (probability units)
+      G2_rho_min: 0.80                # S_lot on own lottery choices; flat items count as 0
+      G2_shift_min: 0.15              # paired full-range shift, probability units
+      G2_random_multiple: 4           # and >= 4x the largest random shift on that task
+      G3_split_half_min: 0.70         # split-half cosine of S_lot (and of S_adv)
+    # Cross-steer, primary pair: self = S_lot, client = C_will. Shift = paired per-item
+    # (top kept dose minus bottom kept dose), item bootstrap, tasks resampled separately.
+    #   leak_self   = (S -> advice) / (C -> advice)       same task, same units
+    #   leak_client = (C -> lottery) / (S -> lottery)
+    #   product     = leak_self * leak_client             cancels potency and sensitivity
+    # HEADLINE = the two leaks and the product as estimates with 95% CIs.
+    # DISTINCT: upper CI of BOTH leaks <= 1/3. CONFLATION: lower CI of product >= 4/9.
+    # ASYMMETRIC: one leak's lower CI >= 2/3 while the other's upper CI <= 1/3.
+    # Otherwise PARTIAL. Requires G2 and C_will's advice shift >= 4x random.
+    # Cosine: |cos| with sign, read against a ladder (random, N_lot, split-half
+    # ceiling). Primary same-context pair: cos(S_lot, C_lot) and cos(S_adv, C_will).
+    # Disattenuated by split-half reliability with a bootstrap CI; the 0.50 / 0.80
+    # bars apply to that CI. Report raw next to it.
+    # Interpretive rule: if cos(S_lot, C_lot) > 0.80, "self" and "client" are one
+    # described-person risk variable in this model (the scoped conflation finding).
+    # Contamination: the frozen tier probe applied to S_adv-prefixed client activations.
+    # Does a "risky advisor" read the same client as riskier? (Descriptive.)
+    # Behavioral, dose 0: advice under each prefix, with the standard framing and with
+    # "Based only on the client's description" softened, to measure prompt gating.
+    # ---- AMENDMENT 2, 2026-11-03, after the PILOT (pilot items only), before any real
+    # item was scored. Pilot: unprompted P(gamble) 0.54 with |order gap| 0.61 and G1
+    # slope 0.022: the model has no default risk taste on these lotteries, it picks a
+    # position. Under any risk prefix it reads them perfectly (order gap 0.01, full flip).
+    # So G1 as written tests taste, not reading, and would stop RQ2c for the wrong reason.
+    #  - G1 (gate) becomes a READING check on the real eval items under the S_lot prefixes:
+    #    mean P(gamble|hi) - P(gamble|lo) >= 0.50 AND mean |order gap| <= 0.10 under both.
+    #  - The 10-20 deal-tracking G1 is still computed on the unprompted items and REPORTED
+    #    as a pre-registered negative finding (no default taste).
+    #  - The lottery steering task stays unprompted; rows keep both orders so we can see
+    #    whether steering moves the merits (both orders) or only the position default.
+    #  - Random floor = mean |per-item shift| (signed means cancel).
+    # Code-review fixes (Fable + Opus, before any real result): leaks judged on |leak|
+    # with draws whose on-task shift <= 0 counted as undefined (inf), not dropped;
+    # ASYMMETRIC checked before CONFLATION; disattenuation uses Spearman-Brown corrected
+    # split-half reliabilities, a bootstrap over cells / vignettes, |cos| clipped to 1, and
+    # requires rel(C_lot) >= 0.70; geometry needs BOTH primary pairs for distinct, either
+    # for conflation; G3 checks S_lot AND S_adv; cos(refit, RQ2b) >= 0.90 is a stop
+    # condition; a verdict that changes when hedged rows are excluded is NO VERDICT.
+    # Logged deviations: random directions run at every k (so the floor exists at the
+    # common |k|max); eval vignettes = 563, not 600 (one tier's implicit-test pool ran
+    # short after the RQ2b core); 815 real lottery items after dropping dominated,
+    # mis-rounded and duplicate items (fit 412 / eval 403).
+    amended_G1_prefix_gap_min: 0.50
+    amended_G1_order_gap_max: 0.10
+  # ---- AMENDMENT 3, 2026-11-03: v2 CONFIRMATORY rerun, written after run 1, before any v2
+  # data. Run 1 (results/gemma-2-9b-it/self_vs_client/) gave the pre-registered NO VERDICT
+  # (common |k|max 0: random_3 hedged 22% at k=1 on a lottery readout with letter mass 0.59;
+  # G2 failed: the option-span S_lot is a position lever, not a risk lever). Run 1 also shows,
+  # EXPLORATORY and stated here verbatim so v2 cannot be tuned around it: (S_adv, C_will) is
+  # CONFLATION at k = 1, 2 and 4, hedged rows in or out (leak_self 0.62-0.67, leak_client
+  # 0.95-0.97), while cos(S_adv, C_will) = 0.13; (S_lot, C_will) is ASYMMETRIC. Reviews: Fable
+  # overseer + Opus diagnoser + critic + data audit + deep analysis (no code bugs found).
+  # v2 asks whether that pattern is a property of the model or an artifact of the readout.
+  v2:
+    results_subdir: self_vs_client_v2
+    primary_pair: [S_adv, C_will]          # unchanged from run 1's best-identified pair
+    calibrators: [C_adv, T_adv, S_adv2, N_adv]   # never enter the primary verdict
+    prefixes:
+      C_adv: "This client is personally {trait}."                 # instructed client, same tokens
+      T_adv: "Your neighbor is personally {trait}."               # third-party risk words
+      S_adv2: "As an advisor, you yourself {trait2}."             # paraphrase ceiling of S_adv
+    steer_site: narrative_mean   # primary; last-token directions saved, steered only for S_lot (exploratory)
+    lottery:
+      scales: [110, 175, 225, 350, 450, 550, 700, 850, 1100, 1300, 1800, 2200, 2800, 3300,
+               4500, 5500, 6500, 8000, 9000, 12000, 17500, 22500, 35000, 45000]   # fresh, disjoint
+      pilot_scales: [130, 650, 2600, 14000]        # fresh pilot, disjoint from everything
+      # the readout is fixed at its cause: force a single-letter answer. Pilot prompt variants
+      # in order; the FIRST that reaches letter mass >= 0.90 and mean |order gap| <= 0.20 at dose
+      # 0 on pilot items is used. If none does, fall back to the relative hedge rule (hedged if
+      # p_letters < 0.5 x the item's own k=0 mass, or < 0.25).
+      # AMENDMENT 3b, 2026-11-03, after the v2 pilot, before any usable v2 lottery data: both
+      # forced-letter variants FAILED the pilot (letter mass 0.006 / 0.013, argmax never a
+      # letter). Greedy decoding showed the cause: the assistant prefill "(" makes the model
+      # start "As a language model, I can't make..."; with no prefill letter mass is ~1.0 for
+      # both the forced prompt and run 1's prompt. The pilot is rerun with no-prefill variants
+      # (same bars, same order rule). Advice prompts keep "(" (letter mass 0.977). The partial
+      # v2 cross (advice and lottery with the failed prompt) is discarded for lottery; advice
+      # keys do not depend on the lottery prompt and are reused.
+      prompt_variants: [force_letter_noprefill, run1_noprefill]
+      failed_variants: [force_letter, force_letter_plain]
+      pilot_letter_mass_min: 0.90
+      pilot_order_gap_max: 0.20
+    eval_vignettes: "implicit_val + run-1-unused implicit_test, tier-stratified up to 200 per tier (85 aggressive, 200 conservative, 200 moderate = 485). implicit_val was only the probe's layer-selection dev set; no direction or steering run ever saw it."
+    doses_k: [-4, -2, -1, 0, 1, 2, 4]
+    n_random: 10                # all k, on 100 vignettes / 200 lottery items
+    random_floor: "max over randoms of mean |per-item shift| on NON-hedged rows, per task and k"
+    kmax_rule: "common |k|max over the GATED named directions only: C_will, S_adv, C_adv, T_adv, S_adv2. Randoms are the null; S_lot_last (exploratory) and the @post rows are reported but cannot void the run (deviation from amendment 1 text, logged; decided after the Fable v2 code review, before any v2 data)"
+    code_review_fixes: "Fable v2 review (pre-launch): hedged-excluded agreement restored (amendment 1); G3 split-half >= 0.70 for S_adv and C_adv; disattenuated bootstrap CI on cos(S_adv, C_will) carries the 0.50 / 0.80 bars; no KV cache in the fp32 scorer; G2 thresholds read from config"
+    logits: "fp32 (final-norm output x lm_head in fp32, Gemma-2 final soft-cap applied)"
+    position_restricted: [S_adv, C_will]   # advice task, steering ONLY on tokens after the client
+                                           # narrative (options + instruction + decision). If
+                                           # S_adv -> advice survives, the self effect is
+                                           # advisor-side; if it vanishes, it runs through the client.
+    lever_rule: "a lottery shift counts only if BOTH option orders move the same way (each order's paired shift has a 95% CI excluding 0, same sign)"
+    gates:
+      G1: "prefix reading check on fresh items (as amendment 2)"
+      G2: "S_adv moves own lottery >= 0.15 AND >= 4 x random floor AND lever_rule"
+      client_floor: "C_will moves advice >= 4 x advice random floor"
+      geometry_gate_min: 0.30   # cos(C_adv, C_will) at L22; below it geometry is "not
+                                # interpretable for referent" and cannot contribute to DISTINCT
+    verdict: "same leak / product rule as amendment 1 on the primary pair at common |k|max; also reported at k = 1 and 2"
 
 pressure:                    # RQ3
   classifiable_min: 0.60
